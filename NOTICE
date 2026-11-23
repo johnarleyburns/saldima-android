@@ -1,0 +1,31 @@
+Saldima for Android
+Copyright (C) 2026 John Arley Burns
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, version 3 only. See LICENSE.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+References and credits
+----------------------
+
+Saldima for Android is an independent implementation. It is not a fork of, and
+contains no code copied from, GnuCash or any other GPL project.
+
+- GnuCash (https://www.gnucash.org) — the file format, accounting model and
+  desktop application this product is compatible with. GPL-2.0-or-later.
+  Behavioural reference and external test oracle only.
+- gnucash-web (https://github.com/joshuabach/gnucash-web) — GPLv3 reference for
+  screens and scope. Behavioural reference only; no code copied.
+- piecash (https://pypi.org/project/piecash) — GPLv3 Python library.
+  Behavioural reference only; no code copied.
+
+The name "GnuCash" is a trademark of the GnuCash project. Saldima uses it only
+to describe compatibility.
+
+Bundled dependencies must be MIT, BSD, Apache-2.0, ISC, 0BSD or CC0. The
+supporter purchase is a one-time consumable, never a subscription and never a
+feature gate.
