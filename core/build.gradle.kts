@@ -10,6 +10,7 @@ kotlin {
 dependencies {
     testImplementation(kotlin("test"))
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+    testImplementation("org.xerial:sqlite-jdbc:3.46.1.3")
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
 }
 
