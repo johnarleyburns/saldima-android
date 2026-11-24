@@ -14,6 +14,7 @@ import guru.parso.saldima.core.SqliteBookReader
 import guru.parso.saldima.core.SqliteRows
 import guru.parso.saldima.core.Totals
 import java.io.File
+import java.util.UUID
 
 /** Owns the first company file on this device. Standalone: no network. */
 class BookRepository(private val context: Context) {
@@ -25,6 +26,7 @@ class BookRepository(private val context: Context) {
         private set
 
     private val directory: File get() = File(context.filesDir, "books").apply { mkdirs() }
+    private var currentFile: File? = null
 
     fun loadExisting() {
         val file = directory.listFiles { candidate -> candidate.extension == "gnucash" }
@@ -49,11 +51,48 @@ class BookRepository(private val context: Context) {
         }
     }
 
+    fun post(date: String, description: String, from: Guid, to: Guid, amount: Money) {
+        val file = currentFile ?: run {
+            error = "Open a book first."
+            return
+        }
+        var database: SQLiteDatabase? = null
+        try {
+            database = SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READWRITE)
+            val tx = UUID.randomUUID().toString().replace("-", "")
+            database.execSQL(
+                "INSERT INTO transactions(guid, currency_guid, num, post_date, enter_date, description) VALUES (?, NULL, '', ?, ?, ?)",
+                arrayOf(tx, "$date 00:00:00", "$date 00:00:00", description),
+            )
+            for ((account, value) in listOf(from to amount, to to Money(-amount.num, amount.denom))) {
+                database.execSQL(
+                    "INSERT INTO splits(guid, tx_guid, account_guid, memo, action, reconcile_state, reconcile_date, value_num, value_denom, quantity_num, quantity_denom, lot_guid) VALUES (?, ?, ?, '', '', 'n', NULL, ?, ?, ?, ?, NULL)",
+                    arrayOf(
+                        UUID.randomUUID().toString().replace("-", ""),
+                        tx,
+                        account.raw,
+                        value.num,
+                        value.denom,
+                        value.num,
+                        value.denom,
+                    ),
+                )
+            }
+            error = null
+            read(file)
+        } catch (failure: Exception) {
+            error = "Could not post: ${failure.message}"
+        } finally {
+            database?.close()
+        }
+    }
+
     private fun read(file: File) {
         var database: SQLiteDatabase? = null
         try {
             database = SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READONLY)
             val loaded = SqliteBookReader.read(QueryRows(database))
+            currentFile = file
             snapshot = loaded
             totals = Totals.rolledUp(loaded)
             error = null
