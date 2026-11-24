@@ -26,6 +26,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.remember
 import androidx.compose.ui.unit.dp
 import guru.parso.saldima.core.SupporterProduct
 
@@ -64,7 +65,11 @@ private fun SaldimaApp() {
         }
     ) { padding ->
         when (selected) {
-            0 -> Placeholder("Accounts", "Open or create a .gnucash book to see its account tree.", padding)
+            0 -> {
+                val context = LocalContext.current
+                val repository = remember { BookRepository(context.applicationContext) }
+                AccountsScreen(repository)
+            }
             1 -> Placeholder("Register", "Transactions appear once a book is open.", padding)
             2 -> Placeholder("Receipts", "Receipts captured on this phone wait here.", padding)
             3 -> Placeholder("Reports", "Balance sheet and profit and loss appear once a book is open.", padding)
