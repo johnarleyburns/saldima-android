@@ -17,11 +17,17 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
@@ -42,8 +48,33 @@ fun AccountsScreen(repository: BookRepository) {
     LaunchedEffect(Unit) { repository.loadExisting() }
 
     val snapshot = repository.snapshot
+    var switching by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Text("Accounts", style = MaterialTheme.typography.headlineMedium)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Accounts", style = MaterialTheme.typography.headlineMedium)
+            Spacer(Modifier.weight(1f))
+            Button(onClick = { switching = true }) {
+                Text(repository.currentName ?: "Books")
+            }
+            DropdownMenu(expanded = switching, onDismissRequest = { switching = false }) {
+                for (file in repository.books) {
+                    DropdownMenuItem(
+                        text = { Text(file.nameWithoutExtension) },
+                        onClick = {
+                            repository.open(file)
+                            switching = false
+                        },
+                    )
+                }
+                DropdownMenuItem(
+                    text = { Text("Open another book\u2026") },
+                    onClick = {
+                        switching = false
+                        launcher.launch(arrayOf("*/*"))
+                    },
+                )
+            }
+        }
         Spacer(Modifier.height(12.dp))
         if (snapshot == null) {
             Text(

@@ -24,15 +24,27 @@ class BookRepository(private val context: Context) {
         private set
     var error by mutableStateOf<String?>(null)
         private set
+    var books by mutableStateOf<List<File>>(emptyList())
+        private set
+    var currentName by mutableStateOf<String?>(null)
+        private set
 
     private val directory: File get() = File(context.filesDir, "books").apply { mkdirs() }
     private var currentFile: File? = null
 
     fun loadExisting() {
-        val file = directory.listFiles { candidate -> candidate.extension == "gnucash" }
-            ?.sortedBy { it.name }
-            ?.firstOrNull() ?: return
+        refreshBooks()
+        if (currentFile == null) books.firstOrNull()?.let(::read)
+    }
+
+    fun open(file: File) {
         read(file)
+    }
+
+    private fun refreshBooks() {
+        books = directory.listFiles { candidate -> candidate.extension == "gnucash" }
+            ?.sortedBy { it.name.lowercase() }
+            .orEmpty()
     }
 
     fun import(uri: Uri) {
@@ -45,6 +57,7 @@ class BookRepository(private val context: Context) {
                 error = "Could not read that file."
                 return
             }
+            refreshBooks()
             read(target)
         } catch (failure: Exception) {
             error = failure.message
@@ -93,6 +106,8 @@ class BookRepository(private val context: Context) {
             database = SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READONLY)
             val loaded = SqliteBookReader.read(QueryRows(database))
             currentFile = file
+            currentName = file.nameWithoutExtension
+            refreshBooks()
             snapshot = loaded
             totals = Totals.rolledUp(loaded)
             error = null
