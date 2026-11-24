@@ -15,14 +15,17 @@ object SqliteBookReader {
     fun read(rows: SqliteRows): BookSnapshot {
         val bookRow = rows.query("SELECT guid, root_account_guid, root_template_guid FROM books LIMIT 1")
             .firstOrNull() ?: throw BookFormatException("book has no books row")
-        val bookGuid = bookRow["root_account_guid"]
-            ?: throw BookFormatException("book has no root account")
+        val bookGuid = bookRow["guid"]
+            ?: throw BookFormatException("book has no GUID")
+        val templateRootGuid = bookRow["root_template_guid"]
+            ?.takeIf { Guid.isValid(it) }
+            ?.let { Guid.parse(it) }
 
         val commodityRows = rows.query("SELECT guid, mnemonic FROM commodities WHERE namespace = 'CURRENCY'")
         val currency = commodityRows.firstOrNull()?.get("mnemonic")
 
         val accounts = rows.query(
-            "SELECT guid, name, account_type, parent_guid, commodity_guid, code, description FROM accounts",
+            "SELECT guid, name, account_type, parent_guid, commodity_guid, code, description, hidden, placeholder FROM accounts",
         ).mapNotNull { row ->
             val guid = row["guid"] ?: return@mapNotNull null
             if (!Guid.isValid(guid)) return@mapNotNull null
@@ -36,6 +39,8 @@ object SqliteBookReader {
                 },
                 code = row["code"] ?: "",
                 description = row["description"] ?: "",
+                hidden = row["hidden"] == "1",
+                placeholder = row["placeholder"] == "1",
             )
         }
         if (accounts.isEmpty()) throw BookFormatException("book has no accounts")
@@ -69,6 +74,7 @@ object SqliteBookReader {
             fraction = transactions.firstOrNull()?.splits?.firstOrNull()?.value?.denom,
             accounts = accounts,
             transactions = transactions,
+            templateRootGuid = templateRootGuid,
         )
     }
 }

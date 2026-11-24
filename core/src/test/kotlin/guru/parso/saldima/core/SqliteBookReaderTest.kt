@@ -35,6 +35,8 @@ class SqliteBookReaderTest {
         )
         val snapshot = SqliteBookReader.read(rows)
         assertEquals("USD", snapshot.currencyCode)
+        assertEquals(Guid.parse("a".repeat(32)), snapshot.bookGuid)
+        assertEquals(Guid.parse("c".repeat(32)), snapshot.templateRootGuid)
         assertEquals(listOf("Root Account", "Bank"), snapshot.accounts.map { it.name })
         assertEquals("BANK", snapshot.accounts.last().type)
         assertEquals("1000", snapshot.accounts.last().code)

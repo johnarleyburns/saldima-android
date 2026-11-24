@@ -32,6 +32,8 @@ object XmlBookReader {
         var commodity: String? = null
         var code = ""
         var description = ""
+        var hidden = false
+        var placeholder = false
     }
 
     private class SplitBuilder {
@@ -56,6 +58,7 @@ object XmlBookReader {
         var account: AccountBuilder? = null
         var transaction: TransactionBuilder? = null
         var split: SplitBuilder? = null
+        var slotKey: String? = null
 
         fun textValue() = text.toString().trim()
         fun local(): String = reader.localName
@@ -71,6 +74,8 @@ object XmlBookReader {
                     commodityCode = builder.commodity,
                     code = builder.code,
                     description = builder.description,
+                    hidden = builder.hidden,
+                    placeholder = builder.placeholder,
                 )
             }
             account = null
@@ -105,7 +110,10 @@ object XmlBookReader {
                     stack += name
                     text.setLength(0)
                     when {
-                        name == "account" && prefix() == "gnc" -> account = AccountBuilder()
+                        name == "account" && prefix() == "gnc" -> {
+                            account = AccountBuilder()
+                            slotKey = null
+                        }
                         name == "transaction" && prefix() == "gnc" -> transaction = TransactionBuilder()
                         name == "split" && prefix() == "trn" && transaction != null -> split = SplitBuilder()
                     }
@@ -142,6 +150,14 @@ object XmlBookReader {
                             "id" to "commodity" -> account!!.commodity = value
                             "code" to "account" -> account!!.code = value
                             "description" to "account" -> account!!.description = value
+                            "key" to "slot" -> slotKey = value
+                            "value" to "slot" -> {
+                                when (slotKey) {
+                                    "placeholder" -> account!!.placeholder = value == "true"
+                                    "hidden" -> account!!.hidden = value == "true"
+                                }
+                                slotKey = null
+                            }
                         }
                         name == "id" && parent == "book" -> guidOrNull(value)?.let { bookGuid = it }
                     }
