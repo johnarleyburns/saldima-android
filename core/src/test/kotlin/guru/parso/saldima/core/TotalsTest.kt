@@ -20,4 +20,14 @@ class TotalsTest {
         assertEquals(Money(2_500, 1), totals.netAssets)
         assertEquals(Money(2_500, 1), totals.profit)
     }
+
+    @Test
+    fun `parent totals include descendants`() {
+        val snapshot = XmlBookReader.read(File("../fixtures/books/oracle-mini.gnucash"))
+        val byName = snapshot.accounts.associateBy { it.name }
+        val rolled = Totals.rolledUp(snapshot)
+        assertEquals(Money(2_500, 1), rolled[byName.getValue("Bank").guid])
+        assertEquals(Money(2_500, 1), rolled[byName.getValue("Assets").guid])
+        assertEquals(Money(-2_500, 1), rolled[byName.getValue("Income").guid])
+    }
 }

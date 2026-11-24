@@ -23,6 +23,26 @@ object Totals {
         return totals
     }
 
+    /** Parent rows show their own balance plus every descendant. */
+    fun rolledUp(snapshot: BookSnapshot): Map<Guid, Money> {
+        val balances = balances(snapshot)
+        val children = mutableMapOf<Guid, MutableList<Guid>>()
+        for (account in snapshot.accounts) {
+            val parent = account.parentGuid ?: continue
+            children.getOrPut(parent) { mutableListOf() }.add(account.guid)
+        }
+        val totals = mutableMapOf<Guid, Money>()
+        fun visit(guid: Guid): Money {
+            totals[guid]?.let { return it }
+            var total = balances[guid] ?: Money.ZERO
+            for (child in children[guid].orEmpty()) total = Money.add(total, visit(child))
+            totals[guid] = total
+            return total
+        }
+        for (account in snapshot.accounts) visit(account.guid)
+        return totals
+    }
+
     fun totals(snapshot: BookSnapshot): BookTotals {
         val balances = balances(snapshot)
         var assets = Money.ZERO
