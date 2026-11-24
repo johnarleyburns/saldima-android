@@ -50,6 +50,8 @@ private val tabs = listOf(
 @Composable
 private fun SaldimaApp() {
     var selected by rememberSaveable { mutableIntStateOf(0) }
+    val context = LocalContext.current
+    val repository = remember { BookRepository(context.applicationContext) }
     Scaffold(
         bottomBar = {
             NavigationBar {
@@ -65,12 +67,8 @@ private fun SaldimaApp() {
         }
     ) { padding ->
         when (selected) {
-            0 -> {
-                val context = LocalContext.current
-                val repository = remember { BookRepository(context.applicationContext) }
-                AccountsScreen(repository)
-            }
-            1 -> Placeholder("Register", "Transactions appear once a book is open.", padding)
+            0 -> AccountsScreen(repository)
+            1 -> JournalScreen(repository)
             2 -> Placeholder("Receipts", "Receipts captured on this phone wait here.", padding)
             3 -> Placeholder("Reports", "Balance sheet and profit and loss appear once a book is open.", padding)
             else -> SettingsScreen(padding)
