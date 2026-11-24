@@ -2,8 +2,11 @@
 package guru.parso.saldima.app
 
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -73,7 +76,7 @@ private fun SaldimaApp() {
             1 -> JournalScreen(repository)
             2 -> Placeholder("Receipts", "Receipts captured on this phone wait here.", padding)
             3 -> ReportsScreen(repository)
-            else -> SettingsScreen(padding)
+            else -> SettingsScreen(repository, padding)
         }
     }
 }
@@ -92,13 +95,48 @@ private fun Placeholder(title: String, message: String, padding: androidx.compos
 }
 
 @Composable
-private fun SettingsScreen(padding: androidx.compose.foundation.layout.PaddingValues) {
+private fun SettingsScreen(
+    repository: BookRepository,
+    padding: androidx.compose.foundation.layout.PaddingValues,
+) {
     val activity = LocalContext.current as android.app.Activity
+    val context = LocalContext.current
     val store = remember { SupporterStore(activity) }
     var supporter by remember { mutableStateOf(store.isSupporter) }
+    val exporter = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/gzip")
+    ) { uri ->
+        if (uri != null) {
+            val exported = repository.exportXml(uri)
+            val message = if (exported) {
+                "Exported GnuCash XML"
+            } else {
+                repository.error ?: "Export failed"
+            }
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+        }
+    }
 
     Column(Modifier.fillMaxSize().padding(padding).padding(24.dp).verticalScroll(rememberScrollState())) {
         Text("Settings", style = MaterialTheme.typography.headlineMedium)
+        Spacer(Modifier.height(24.dp))
+        Text("Book", style = MaterialTheme.typography.titleMedium)
+        Text(
+            repository.currentName ?: "No book open",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Button(
+            onClick = {
+                exporter.launch("${repository.currentName ?: "Saldima"}-xml.gnucash")
+            },
+            enabled = repository.snapshot != null,
+        ) {
+            Text("Export as GnuCash XML")
+        }
+        Text(
+            "Gzip XML with the same accounts and postings; GnuCash opens it directly.",
+            style = MaterialTheme.typography.bodySmall,
+        )
         Spacer(Modifier.height(24.dp))
         Text(
             if (supporter) "Thanks for supporting Saldima" else "Become a Supporter",

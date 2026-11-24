@@ -10,6 +10,8 @@ data class SnapshotAccount(
     val commodityCode: String? = null,
     val code: String = "",
     val description: String = "",
+    val hidden: Boolean = false,
+    val placeholder: Boolean = false,
 )
 
 data class SnapshotSplit(val accountGuid: Guid, val value: Money)
@@ -28,4 +30,5 @@ data class BookSnapshot(
     val fraction: Long? = null,
     val accounts: List<SnapshotAccount>,
     val transactions: List<SnapshotTransaction>,
+    val templateRootGuid: Guid? = null,
 )

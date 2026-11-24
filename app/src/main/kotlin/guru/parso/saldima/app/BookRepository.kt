@@ -9,10 +9,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import guru.parso.saldima.core.BookSnapshot
 import guru.parso.saldima.core.Guid
+import guru.parso.saldima.core.IdGenerator
 import guru.parso.saldima.core.Money
 import guru.parso.saldima.core.SqliteBookReader
 import guru.parso.saldima.core.SqliteRows
 import guru.parso.saldima.core.Totals
+import guru.parso.saldima.core.XmlBookWriter
 import java.io.File
 import java.util.UUID
 
@@ -31,6 +33,32 @@ class BookRepository(private val context: Context) {
 
     private val directory: File get() = File(context.filesDir, "books").apply { mkdirs() }
     private var currentFile: File? = null
+    private val exportIds = IdGenerator {
+        Guid.parse(UUID.randomUUID().toString().replace("-", ""))
+    }
+
+    /** Writes a gzip GnuCash XML export of the open book to a chosen document. */
+    fun exportXml(uri: Uri): Boolean {
+        val loaded = snapshot
+        if (loaded == null) {
+            error = "Open a book first."
+            return false
+        }
+        return try {
+            val bytes = XmlBookWriter.gzip(loaded, exportIds)
+            context.contentResolver.openOutputStream(uri)?.use { output ->
+                output.write(bytes)
+            } ?: run {
+                error = "Could not write that export."
+                return false
+            }
+            error = null
+            true
+        } catch (failure: Exception) {
+            error = "Could not export: ${failure.message}"
+            false
+        }
+    }
 
     fun loadExisting() {
         refreshBooks()
