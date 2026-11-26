@@ -28,6 +28,8 @@ class XmlBookDocument private constructor(
 ) {
     private val accountIndex = mutableMapOf<Guid, XmlNode>()
     private val transactionIndex = mutableMapOf<Guid, XmlNode>()
+    private val customerIndex = mutableMapOf<Guid, XmlNode>()
+    private val invoiceIndex = mutableMapOf<Guid, XmlNode>()
 
     init {
         reindex()
@@ -36,11 +38,19 @@ class XmlBookDocument private constructor(
     private fun reindex() {
         accountIndex.clear()
         transactionIndex.clear()
+        customerIndex.clear()
+        invoiceIndex.clear()
         for (node in children(book, "account")) {
             guidValue(node, "id")?.let { accountIndex[it] = node }
         }
         for (node in children(book, "transaction")) {
             guidValue(node, "id")?.let { transactionIndex[it] = node }
+        }
+        for (node in children(book, "GncCustomer")) {
+            guidValue(node, "guid")?.let { customerIndex[it] = node }
+        }
+        for (node in children(book, "GncInvoice")) {
+            guidValue(node, "guid")?.let { invoiceIndex[it] = node }
         }
     }
 
@@ -55,6 +65,11 @@ class XmlBookDocument private constructor(
             "xmlns:split" to "http://www.gnucash.org/XML/split",
             "xmlns:trn" to "http://www.gnucash.org/XML/trn",
             "xmlns:ts" to "http://www.gnucash.org/XML/ts",
+            "xmlns:cust" to "http://www.gnucash.org/XML/cust",
+            "xmlns:addr" to "http://www.gnucash.org/XML/addr",
+            "xmlns:invoice" to "http://www.gnucash.org/XML/invoice",
+            "xmlns:entry" to "http://www.gnucash.org/XML/entry",
+            "xmlns:owner" to "http://www.gnucash.org/XML/owner",
         )
 
         fun parse(bytes: ByteArray): XmlBookDocument {
@@ -238,6 +253,29 @@ class XmlBookDocument private constructor(
             return node
         }
 
+        private fun customerNode(guid: Guid, draft: CustomerDraft, currencyCode: String): XmlNode {
+            val node = XmlNode("gnc:GncCustomer")
+            node.attributes["version"] = "2.0.0"
+            node.addChild(leaf("cust:guid", guid.raw, "type" to "guid"))
+            node.addChild(leaf("cust:name", draft.name))
+            node.addChild(leaf("cust:id", draft.customerNumber))
+            val address = XmlNode("cust:addr")
+            address.attributes["version"] = "2.0.0"
+            address.addChild(leaf("addr:name", draft.addressName))
+            address.addChild(leaf("addr:addr1", draft.addressLine1))
+            address.addChild(leaf("addr:addr2", draft.addressLine2))
+            address.addChild(leaf("addr:phone", draft.phone))
+            address.addChild(leaf("addr:email", draft.email))
+            node.addChild(address)
+            node.addChild(leaf("cust:notes", draft.notes))
+            node.addChild(leaf("cust:active", if (draft.active) "1" else "0"))
+            val currency = XmlNode("cust:currency")
+            currency.addChild(leaf("cmdty:space", "CURRENCY"))
+            currency.addChild(leaf("cmdty:id", currencyCode))
+            node.addChild(currency)
+            return node
+        }
+
         private fun leaf(name: String, text: String, vararg attributes: Pair<String, String>): XmlNode {
             val node = XmlNode(name)
             for ((key, value) in attributes) node.attributes[key] = value
@@ -330,9 +368,74 @@ class XmlBookDocument private constructor(
         val splits = children(splitsContainer, "split").mapNotNull { splitNode ->
             val account = guidValue(splitNode, "account") ?: return@mapNotNull null
             val value = firstChild(splitNode, "value")?.text?.let(::rational) ?: return@mapNotNull null
-            SnapshotSplit(account, value)
+            val splitGuid = guidValue(splitNode, "id")
+            val reconcileState = firstChild(splitNode, "reconciled-state")?.text?.ifEmpty { null } ?: "n"
+            val reconcileDate = firstChild(splitNode, "reconcile-date")?.let { firstChild(it, "date")?.text }
+            SnapshotSplit(account, value, splitGuid, reconcileState, reconcileDate)
         }
-        return SnapshotTransaction(guid, date, description, currency, splits)
+        val docLink = firstChild(node, "slots")
+            ?.let { slots -> children(slots, "slot").firstOrNull { firstChild(it, "key")?.text == "assoc_uri" } }
+            ?.let { firstChild(it, "value")?.text }
+        return SnapshotTransaction(guid, date, description, currency, splits, docLink)
+    }
+
+    /**
+     * Sets one split's reconcile state, the same action as checking a row
+     * off in GnuCash's Reconcile window. `reconcileDate` is required for
+     * `"y"` (reconciled) and cleared for any other state, matching desktop
+     * GnuCash.
+     */
+    fun setSplitReconcileState(transactionGuid: Guid, splitGuid: Guid, state: String, reconcileDate: String? = null) {
+        val transactionNode = transactionIndex[transactionGuid]
+            ?: throw BookFormatException("unknown transaction ${transactionGuid.raw}")
+        val splitsContainer = firstChild(transactionNode, "splits") ?: transactionNode
+        val splitNode = children(splitsContainer, "split").firstOrNull { guidValue(it, "id") == splitGuid }
+            ?: throw BookFormatException("unknown split ${splitGuid.raw}")
+        setChildText(splitNode, "reconciled-state", "split:reconciled-state", state)
+        val existingDate = firstChild(splitNode, "reconcile-date")
+        if (state == "y") {
+            if (reconcileDate == null) {
+                throw BookFormatException("a reconcile date is required to mark a split reconciled")
+            }
+            if (existingDate != null) {
+                firstChild(existingDate, "date")?.let { it.text = reconcileDate }
+            } else {
+                val dateNode = XmlNode("split:reconcile-date")
+                dateNode.addChild(leaf("ts:date", reconcileDate))
+                splitNode.addChild(dateNode)
+            }
+        } else {
+            existingDate?.detach()
+        }
+    }
+
+    /**
+     * Sets or clears a transaction's "Associate File/Location" -- an
+     * `assoc_uri` slot, the same slot desktop GnuCash's own right-click
+     * action writes. `uri = null` removes it.
+     */
+    fun setTransactionDocLink(transactionGuid: Guid, uri: String?) {
+        val transactionNode = transactionIndex[transactionGuid]
+            ?: throw BookFormatException("unknown transaction ${transactionGuid.raw}")
+        var slots = firstChild(transactionNode, "slots")
+        if (slots == null) {
+            slots = XmlNode("trn:slots")
+            transactionNode.addChild(slots)
+        }
+        val existing = children(slots, "slot").firstOrNull { firstChild(it, "key")?.text == "assoc_uri" }
+        if (uri != null) {
+            if (existing != null) {
+                firstChild(existing, "value")?.let { it.text = uri }
+            } else {
+                val slot = XmlNode("slot")
+                slot.addChild(leaf("slot:key", "assoc_uri"))
+                slot.addChild(leaf("slot:value", uri, "type" to "string"))
+                slots.addChild(slot)
+            }
+        } else {
+            existing?.detach()
+        }
+        if (slots.children.isEmpty()) slots.detach()
     }
 
     /** Sums each account's split value (the book currency amount); not rolled up to parents. */
@@ -463,6 +566,213 @@ class XmlBookDocument private constructor(
         val node = transactionIndex[guid] ?: return
         node.detach()
         transactionIndex.remove(guid)
+    }
+
+    // MARK: - Customers (GncCustomer)
+
+    fun customers(): List<XmlCustomer> = customerIndex.values.mapNotNull(::customerRow)
+
+    fun customer(guid: Guid): XmlCustomer? = customerIndex[guid]?.let(::customerRow)
+
+    private fun customerRow(node: XmlNode): XmlCustomer? {
+        val guid = guidValue(node, "guid") ?: return null
+        val address = firstChild(node, "addr")
+        fun addressField(name: String): String = address?.let { firstChild(it, name)?.text } ?: ""
+        return XmlCustomer(
+            guid = guid,
+            name = firstChild(node, "name")?.text ?: "",
+            customerNumber = firstChild(node, "id")?.text ?: "",
+            addressName = addressField("name"),
+            addressLine1 = addressField("addr1"),
+            addressLine2 = addressField("addr2"),
+            phone = addressField("phone"),
+            email = addressField("email"),
+            notes = firstChild(node, "notes")?.text ?: "",
+            active = firstChild(node, "active")?.text != "0",
+        )
+    }
+
+    fun createCustomer(guid: Guid, draft: CustomerDraft, currencyCode: String): XmlCustomer {
+        if (customerIndex.containsKey(guid)) throw BookFormatException("duplicate customer ${guid.raw}")
+        val node = customerNode(guid, draft, currencyCode)
+        book.addChild(node)
+        customerIndex[guid] = node
+        return customerRow(node)!!
+    }
+
+    fun updateCustomer(
+        guid: Guid,
+        name: String? = null,
+        customerNumber: String? = null,
+        addressName: String? = null,
+        addressLine1: String? = null,
+        addressLine2: String? = null,
+        phone: String? = null,
+        email: String? = null,
+        notes: String? = null,
+        active: Boolean? = null,
+    ): XmlCustomer {
+        val node = customerIndex[guid] ?: throw BookFormatException("unknown customer ${guid.raw}")
+        name?.let { setChildText(node, "name", "cust:name", it) }
+        customerNumber?.let { setChildText(node, "id", "cust:id", it) }
+        notes?.let { setChildText(node, "notes", "cust:notes", it) }
+        active?.let { setChildText(node, "active", "cust:active", if (it) "1" else "0") }
+        if (addressName != null || addressLine1 != null || addressLine2 != null || phone != null || email != null) {
+            var address = firstChild(node, "addr")
+            if (address == null) {
+                address = XmlNode("cust:addr")
+                address.attributes["version"] = "2.0.0"
+                node.addChild(address)
+            }
+            addressName?.let { setChildText(address, "name", "addr:name", it) }
+            addressLine1?.let { setChildText(address, "addr1", "addr:addr1", it) }
+            addressLine2?.let { setChildText(address, "addr2", "addr:addr2", it) }
+            phone?.let { setChildText(address, "phone", "addr:phone", it) }
+            email?.let { setChildText(address, "email", "addr:email", it) }
+        }
+        return customerRow(node)!!
+    }
+
+    fun deleteCustomer(guid: Guid) {
+        val node = customerIndex[guid] ?: return
+        node.detach()
+        customerIndex.remove(guid)
+    }
+
+    fun customerInUse(guid: Guid): Boolean = invoices().any { it.customerGuid == guid }
+
+    // MARK: - Invoices and entries (GncInvoice / GncEntry)
+
+    fun invoices(): List<XmlInvoice> = invoiceIndex.values.mapNotNull(::invoiceRow)
+
+    fun invoice(guid: Guid): XmlInvoice? = invoiceIndex[guid]?.let(::invoiceRow)
+
+    private fun invoiceRow(node: XmlNode): XmlInvoice? {
+        val guid = guidValue(node, "guid") ?: return null
+        val owner = firstChild(node, "owner")
+        return XmlInvoice(
+            guid = guid,
+            invoiceNumber = firstChild(node, "id")?.text ?: "",
+            customerGuid = owner?.let { guidValue(it, "id") },
+            dateOpened = firstChild(node, "opened")?.let { firstChild(it, "date")?.text } ?: "",
+            datePosted = firstChild(node, "posted")?.let { firstChild(it, "date")?.text },
+            notes = firstChild(node, "notes")?.text ?: "",
+            active = firstChild(node, "active")?.text != "0",
+            postedTransactionGuid = guidValue(node, "posttxn"),
+            receivableAccountGuid = guidValue(node, "postacc"),
+        )
+    }
+
+    /** Every line on one invoice, oldest first. */
+    fun invoiceEntries(invoiceGuid: Guid): List<XmlInvoiceEntry> =
+        children(book, "GncEntry").mapNotNull(::entryRow)
+            .filter { it.invoiceGuid == invoiceGuid }
+            .sortedWith(compareBy({ it.date }, { it.guid.raw }))
+
+    private fun entryRow(node: XmlNode): XmlInvoiceEntry? {
+        val guid = guidValue(node, "guid") ?: return null
+        val invoiceGuid = guidValue(node, "invoice") ?: return null
+        val incomeAccountGuid = guidValue(node, "i-acct") ?: return null
+        val date = firstChild(node, "date")?.let { firstChild(it, "date")?.text } ?: ""
+        val description = firstChild(node, "description")?.text ?: ""
+        val quantity = firstChild(node, "qty")?.text?.let(::rational) ?: return null
+        val unitPrice = firstChild(node, "i-price")?.text?.let(::rational) ?: return null
+        return XmlInvoiceEntry(guid, invoiceGuid, date, description, quantity, unitPrice, incomeAccountGuid)
+    }
+
+    fun createInvoice(
+        guid: Guid,
+        customerGuid: Guid,
+        invoiceNumber: String,
+        dateOpened: String,
+        notes: String = "",
+        currencyCode: String,
+    ): XmlInvoice {
+        if (invoiceIndex.containsKey(guid)) throw BookFormatException("duplicate invoice ${guid.raw}")
+        val owner = XmlNode("invoice:owner")
+        owner.attributes["version"] = "2.0.0"
+        owner.addChild(leaf("owner:type", "gncCustomer"))
+        owner.addChild(leaf("owner:id", customerGuid.raw, "type" to "guid"))
+
+        val node = XmlNode("gnc:GncInvoice")
+        node.attributes["version"] = "2.0.0"
+        node.addChild(leaf("invoice:guid", guid.raw, "type" to "guid"))
+        node.addChild(leaf("invoice:id", invoiceNumber))
+        node.addChild(owner)
+        val opened = XmlNode("invoice:opened")
+        opened.addChild(leaf("ts:date", dateOpened))
+        node.addChild(opened)
+        node.addChild(leaf("invoice:notes", notes))
+        node.addChild(leaf("invoice:active", "1"))
+        val currency = XmlNode("invoice:currency")
+        currency.addChild(leaf("cmdty:space", "CURRENCY"))
+        currency.addChild(leaf("cmdty:id", currencyCode))
+        node.addChild(currency)
+
+        book.addChild(node)
+        invoiceIndex[guid] = node
+        return invoiceRow(node)!!
+    }
+
+    /** Drafts only: a posted invoice is part of permanent ledger history. */
+    fun deleteInvoice(guid: Guid) {
+        val node = invoiceIndex[guid] ?: return
+        for (entry in children(book, "GncEntry")) {
+            if (guidValue(entry, "invoice") == guid) entry.detach()
+        }
+        node.detach()
+        invoiceIndex.remove(guid)
+    }
+
+    fun addInvoiceEntry(
+        guid: Guid,
+        invoiceGuid: Guid,
+        date: String,
+        description: String,
+        quantity: Money,
+        unitPrice: Money,
+        incomeAccountGuid: Guid,
+    ): XmlInvoiceEntry {
+        val node = XmlNode("gnc:GncEntry")
+        node.attributes["version"] = "2.0.0"
+        node.addChild(leaf("entry:guid", guid.raw, "type" to "guid"))
+        val dateNode = XmlNode("entry:date")
+        dateNode.addChild(leaf("ts:date", date))
+        node.addChild(dateNode)
+        val enteredNode = XmlNode("entry:entered")
+        enteredNode.addChild(leaf("ts:date", date))
+        node.addChild(enteredNode)
+        node.addChild(leaf("entry:description", description))
+        node.addChild(leaf("entry:qty", "${quantity.num}/${quantity.denom}"))
+        node.addChild(leaf("entry:i-acct", incomeAccountGuid.raw, "type" to "guid"))
+        node.addChild(leaf("entry:i-price", "${unitPrice.num}/${unitPrice.denom}"))
+        node.addChild(leaf("entry:i-discount", "0/100"))
+        node.addChild(leaf("entry:invoice", invoiceGuid.raw, "type" to "guid"))
+        node.addChild(leaf("entry:i-disc-type", "PERCENT"))
+        node.addChild(leaf("entry:i-disc-how", "PRETAX"))
+        node.addChild(leaf("entry:i-taxable", "0"))
+        node.addChild(leaf("entry:i-taxincluded", "0"))
+        book.addChild(node)
+        return entryRow(node) ?: throw BookFormatException("failed to build invoice entry")
+    }
+
+    fun deleteInvoiceEntry(guid: Guid) {
+        children(book, "GncEntry").firstOrNull { guidValue(it, "guid") == guid }?.detach()
+    }
+
+    /**
+     * Marks a draft invoice posted: stamps the posted date, the real
+     * ledger transaction behind it, and the receivable account used --
+     * matching desktop GnuCash's own "Post Invoice" action. The caller
+     * creates that transaction separately via `postTransaction`.
+     */
+    fun markInvoicePosted(guid: Guid, postedDate: String, transactionGuid: Guid, receivableAccountGuid: Guid) {
+        val node = invoiceIndex[guid] ?: throw BookFormatException("unknown invoice ${guid.raw}")
+        val posted = XmlNode("invoice:posted")
+        posted.addChild(leaf("ts:date", postedDate))
+        node.addChild(posted)
+        node.addChild(leaf("invoice:posttxn", transactionGuid.raw, "type" to "guid"))
+        node.addChild(leaf("invoice:postacc", receivableAccountGuid.raw, "type" to "guid"))
     }
 
     // MARK: - Tree helpers
