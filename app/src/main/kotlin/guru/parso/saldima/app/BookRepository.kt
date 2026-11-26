@@ -15,16 +15,23 @@ import guru.parso.saldima.core.Guid
 import guru.parso.saldima.core.IdGenerator
 import guru.parso.saldima.core.Money
 import guru.parso.saldima.core.SqliteBookReader
-import guru.parso.saldima.core.SqliteBookWriter
 import guru.parso.saldima.core.SqliteRows
-import guru.parso.saldima.core.SqliteWrites
 import guru.parso.saldima.core.Totals
-import guru.parso.saldima.core.XmlBookReader
-import guru.parso.saldima.core.XmlBookWriter
+import guru.parso.saldima.core.XmlBookDocument
 import java.io.File
 import java.util.UUID
 
-/** Owns the first company file on this device. Standalone: no network. */
+/**
+ * Owns the first company file on this device. Standalone: no network.
+ *
+ * GnuCash XML is the canonical on-disk book (`XmlBookDocument`): the whole
+ * file is parsed once on open, mutated in memory, and atomically rewritten
+ * on every save -- the same way desktop GnuCash's own XML backend behaves.
+ * SQLite is an import/export adapter only: a legacy SQLite-dialect file
+ * still opens transparently (read into the equivalent in-memory XML model
+ * via `SqliteBookReader` + `XmlBookDocument.build`) but is rewritten as XML
+ * the first time anything saves.
+ */
 class BookRepository(private val context: Context) {
     var snapshot by mutableStateOf<BookSnapshot?>(null)
         private set
@@ -38,6 +45,7 @@ class BookRepository(private val context: Context) {
         private set
 
     private val directory: File get() = File(context.filesDir, "books").apply { mkdirs() }
+    private var document: XmlBookDocument? = null
     private var currentFile: File? = null
     private val ids = IdGenerator {
         Guid.parse(UUID.randomUUID().toString().replace("-", ""))
@@ -45,15 +53,14 @@ class BookRepository(private val context: Context) {
 
     /** Writes a gzip GnuCash XML export of the open book to a chosen document. */
     fun exportXml(uri: Uri): Boolean {
-        val loaded = snapshot
+        val loaded = document
         if (loaded == null) {
             error = "Open a book first."
             return false
         }
         return try {
-            val bytes = XmlBookWriter.gzip(loaded, ids)
             context.contentResolver.openOutputStream(uri)?.use { output ->
-                output.write(bytes)
+                output.write(loaded.gzip())
             } ?: run {
                 error = "Could not write that export."
                 return false
@@ -82,11 +89,10 @@ class BookRepository(private val context: Context) {
     }
 
     /**
-     * Imports a `.gnucash` file (XML or SQLite). An XML book is materialized
-     * as a fresh SQLite working copy (SQLite is still the live store today;
-     * the XML import boundary is the same shape the eventual XML-canonical
-     * migration will use), so it opens and edits exactly like a book created
-     * on-device.
+     * Imports a `.gnucash` file. An XML book is copied in as-is (XML is
+     * already the canonical format); a legacy SQLite-dialect book is
+     * materialized into a fresh XML working copy, so either source opens
+     * and edits exactly like a book created on-device.
      */
     fun import(uri: Uri) {
         try {
@@ -101,17 +107,10 @@ class BookRepository(private val context: Context) {
                 return
             }
             when (BookFiles.detect(staged)) {
-                BookFormat.SQLITE -> staged.copyTo(target, overwrite = true)
-                BookFormat.XML -> {
-                    val imported = XmlBookReader.read(staged)
-                    target.delete()
-                    var created: SQLiteDatabase? = null
-                    try {
-                        created = SQLiteDatabase.openOrCreateDatabase(target, null)
-                        SqliteBookWriter.materialize(imported, DatabaseWrites(created), ids)
-                    } finally {
-                        created?.close()
-                    }
+                BookFormat.XML -> staged.copyTo(target, overwrite = true)
+                BookFormat.SQLITE -> {
+                    val imported = readSqliteSnapshot(staged)
+                    target.writeBytes(XmlBookDocument.build(imported, ids.next(), ids).gzip())
                 }
             }
             staged.delete()
@@ -129,47 +128,26 @@ class BookRepository(private val context: Context) {
         code: String = "",
         description: String = "",
     ): Guid? {
-        val file = currentFile ?: run {
+        val doc = document ?: run {
             error = "Open a book first."
             return null
         }
-        var database: SQLiteDatabase? = null
-        return try {
-            database = SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READWRITE)
-            val currencyGuid = database.rawQuery(
-                "SELECT commodity_guid FROM accounts WHERE guid = ? LIMIT 1",
-                arrayOf(parentGuid.raw),
-            ).use { cursor -> if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) else null }
-                ?: database.rawQuery(
-                    "SELECT guid FROM commodities WHERE namespace = 'CURRENCY' LIMIT 1",
-                    null,
-                ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
-            val guid = ids.next()
-            SqliteBookWriter.insertAccount(
-                DatabaseWrites(database),
-                guid = guid,
-                name = name,
-                type = type.name,
-                commodity = currencyGuid?.let { Guid.parse(it) },
-                parent = parentGuid,
-                hidden = false,
-                placeholder = false,
-                code = code,
-                description = description,
-            )
-            error = null
-            read(file)
-            guid
-        } catch (failure: Exception) {
-            error = "Could not add account: ${failure.message}"
-            null
-        } finally {
-            database?.close()
-        }
+        val guid = ids.next()
+        doc.createAccount(
+            guid = guid,
+            name = name,
+            type = type.name,
+            parentGuid = parentGuid,
+            code = code,
+            description = description,
+        )
+        error = null
+        save()
+        return guid
     }
 
     fun updateAccount(guid: Guid, name: String, code: String, description: String) {
-        val file = currentFile ?: run {
+        val doc = document ?: run {
             error = "Open a book first."
             return
         }
@@ -177,50 +155,36 @@ class BookRepository(private val context: Context) {
             error = "Enter a name."
             return
         }
-        var database: SQLiteDatabase? = null
-        try {
-            database = SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READWRITE)
-            database.execSQL(
-                "UPDATE accounts SET name = ?, code = ?, description = ? WHERE guid = ?",
-                arrayOf(name, code, description, guid.raw),
-            )
-            error = null
-            read(file)
-        } catch (failure: Exception) {
-            error = "Could not update account: ${failure.message}"
-        } finally {
-            database?.close()
+        val existing = doc.account(guid) ?: run {
+            error = "Unknown account."
+            return
         }
+        doc.updateAccount(
+            guid,
+            name = name,
+            type = existing.type,
+            parentGuid = existing.parentGuid,
+            code = code,
+            description = description,
+            hidden = existing.hidden,
+            placeholder = existing.placeholder,
+        )
+        error = null
+        save()
     }
 
     fun deleteAccount(guid: Guid) {
-        val file = currentFile ?: run {
+        val doc = document ?: run {
             error = "Open a book first."
             return
         }
-        var database: SQLiteDatabase? = null
-        try {
-            database = SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READWRITE)
-            val children = database.rawQuery(
-                "SELECT count(*) FROM accounts WHERE parent_guid = ?",
-                arrayOf(guid.raw),
-            ).use { cursor -> cursor.moveToFirst() && cursor.getInt(0) > 0 }
-            val splits = database.rawQuery(
-                "SELECT count(*) FROM splits WHERE account_guid = ?",
-                arrayOf(guid.raw),
-            ).use { cursor -> cursor.moveToFirst() && cursor.getInt(0) > 0 }
-            if (children || splits) {
-                error = "Move or delete this account's children and transactions first."
-                return
-            }
-            database.execSQL("DELETE FROM accounts WHERE guid = ?", arrayOf(guid.raw))
-            error = null
-            read(file)
-        } catch (failure: Exception) {
-            error = "Could not delete account: ${failure.message}"
-        } finally {
-            database?.close()
+        if (doc.accountCount(guid) > 0 || doc.splitCount(guid) > 0) {
+            error = "Move or delete this account's children and transactions first."
+            return
         }
+        doc.deleteAccount(guid)
+        error = null
+        save()
     }
 
     /**
@@ -239,77 +203,84 @@ class BookRepository(private val context: Context) {
             error = "The splits must sum to zero."
             return
         }
-        val file = currentFile ?: run {
+        val doc = document ?: run {
             error = "Open a book first."
             return
         }
-        var database: SQLiteDatabase? = null
-        try {
-            database = SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READWRITE)
-            val tx = UUID.randomUUID().toString().replace("-", "")
-            database.execSQL(
-                "INSERT INTO transactions(guid, currency_guid, num, post_date, enter_date, description) VALUES (?, NULL, '', ?, ?, ?)",
-                arrayOf(tx, "$date 00:00:00", "$date 00:00:00", description),
-            )
-            for ((account, value) in splits) {
-                database.execSQL(
-                    "INSERT INTO splits(guid, tx_guid, account_guid, memo, action, reconcile_state, reconcile_date, value_num, value_denom, quantity_num, quantity_denom, lot_guid) VALUES (?, ?, ?, '', '', 'n', NULL, ?, ?, ?, ?, NULL)",
-                    arrayOf(
-                        UUID.randomUUID().toString().replace("-", ""),
-                        tx,
-                        account.raw,
-                        value.num,
-                        value.denom,
-                        value.num,
-                        value.denom,
-                    ),
-                )
-            }
-            error = null
-            read(file)
-        } catch (failure: Exception) {
-            error = "Could not post: ${failure.message}"
-        } finally {
-            database?.close()
-        }
+        doc.postTransaction(
+            guid = ids.next(),
+            date = date,
+            description = description,
+            splits = splits.map { (account, value) -> Triple(account, value, ids.next()) },
+        )
+        error = null
+        save()
     }
 
     private fun read(file: File) {
-        var database: SQLiteDatabase? = null
         try {
-            database = SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READONLY)
-            val loaded = SqliteBookReader.read(QueryRows(database))
+            val format = BookFiles.detect(file)
+            val doc = when (format) {
+                BookFormat.XML -> XmlBookDocument.parse(inflateIfGzip(file.readBytes()))
+                BookFormat.SQLITE -> XmlBookDocument.build(readSqliteSnapshot(file), ids.next(), ids)
+            }
+            document = doc
             currentFile = file
             currentName = file.nameWithoutExtension
             refreshBooks()
-            snapshot = loaded
-            totals = Totals.rolledUp(loaded)
+            applySnapshot(doc)
             error = null
         } catch (failure: Exception) {
-            error = "That file is not a GnuCash SQLite book."
-        } finally {
-            database?.close()
+            error = "That file is not a GnuCash book: ${failure.message}"
         }
     }
 
-    private class DatabaseWrites(private val database: SQLiteDatabase) : SqliteWrites {
-        override fun exec(sql: String) {
-            database.execSQL(sql)
-        }
+    private fun applySnapshot(doc: XmlBookDocument) {
+        val currency = doc.currency()
+        val built = BookSnapshot(
+            bookGuid = doc.bookGuid() ?: ids.next(),
+            currencyCode = currency?.code,
+            fraction = currency?.fraction,
+            accounts = doc.accounts(),
+            transactions = doc.transactions(),
+        )
+        snapshot = built
+        totals = Totals.rolledUp(built)
+    }
 
-        override fun insert(sql: String, params: List<Any?>) {
-            database.execSQL(sql, params.toTypedArray())
+    /**
+     * Atomically rewrites the whole book, the way desktop GnuCash's XML
+     * backend saves: write a temporary file, then replace the original. A
+     * fixed name is safe -- the repository is only ever driven from the
+     * main thread, so there is never more than one writer at a time.
+     */
+    private fun save() {
+        val doc = document ?: return
+        val file = currentFile ?: return
+        val temp = File(file.parentFile, ".${file.name}-saving.tmp")
+        try {
+            temp.writeBytes(doc.gzip())
+            if (file.exists()) file.delete()
+            temp.renameTo(file)
+            applySnapshot(doc)
+        } catch (failure: Exception) {
+            temp.delete()
+            error = "Could not save: ${failure.message}"
         }
+    }
 
-        override fun <T> inTransaction(block: () -> T): T {
-            database.beginTransaction()
-            try {
-                val result = block()
-                database.setTransactionSuccessful()
-                return result
-            } finally {
-                database.endTransaction()
-            }
+    private fun inflateIfGzip(bytes: ByteArray): ByteArray {
+        if (bytes.size < 2 || bytes[0] != 0x1f.toByte() || bytes[1] != 0x8b.toByte()) return bytes
+        return java.util.zip.GZIPInputStream(bytes.inputStream()).readBytes()
+    }
+
+    private fun readSqliteSnapshot(file: File): BookSnapshot {
+        var database: SQLiteDatabase? = null
+        return try {
+            database = SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READONLY)
+            SqliteBookReader.read(QueryRows(database))
+        } finally {
+            database?.close()
         }
     }
 

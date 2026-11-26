@@ -37,14 +37,16 @@ Stop and ask if a decision is missing; never guess.
   standalone mode.
 - **`:app`**: Compose UI, SQLite book storage, Billing adapter, Keychain-equivalent
   encrypted token storage (Android Keystore).
-- **Persistence (migrating — see `docs/architecture/TECHNICAL-DESIGN.md`):**
-  target is GnuCash XML as the sole canonical on-disk book; SQLite is an
-  import/export adapter only (reading a desktop SQLite-dialect file to
-  convert into the internal XML model, or writing one on export), never the
-  live store. Until that migration lands, the running app still uses a
-  hand-rolled `SQLiteOpenHelper`/`SQLiteDatabase` over the GnuCash tables
-  with numbered migrations as the live store — do not build new accounting
-  features against it. No Room, no ORM rewriting GnuCash tables.
+- **Persistence:** GnuCash XML is the sole canonical on-disk book
+  (`XmlBookDocument`, in `BookRepository`): the whole file is parsed once
+  on open, mutated in memory, and atomically rewritten on every save — the
+  same way desktop GnuCash's own XML backend behaves. SQLite is an
+  import/export adapter only: `SqliteBookReader` reads a desktop
+  SQLite-dialect file into a `BookSnapshot`, and `XmlBookDocument.build`
+  materializes it into a fresh XML working copy. A legacy SQLite-dialect
+  file still opens transparently (read into the equivalent in-memory XML
+  model) but is rewritten as XML the first time anything saves. No Room, no
+  ORM rewriting GnuCash tables.
 - **Purchases:** Google Play Billing one-time **consumable** `saldima_supporter`.
   It never gates a feature; it sets a one-way local Supporter flag/badge, just
   like Voxglass. No subscription. Hosting is bought on the web.

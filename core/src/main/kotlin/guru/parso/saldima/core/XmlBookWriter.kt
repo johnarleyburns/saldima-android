@@ -131,8 +131,9 @@ object XmlBookWriter {
     /**
      * Parents must be written before children; GnuCash resolves the parent
      * while reading. The template root subtree is not part of the export.
+     * Internal so `XmlBookDocument.build` can reuse the same ordering.
      */
-    private fun orderedAccounts(snapshot: BookSnapshot): List<SnapshotAccount> {
+    internal fun orderedAccounts(snapshot: BookSnapshot): List<SnapshotAccount> {
         val children = snapshot.accounts.groupBy { it.parentGuid }
         val excluded = mutableSetOf<Guid>()
         val templateRoot = snapshot.templateRootGuid
