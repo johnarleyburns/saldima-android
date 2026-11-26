@@ -13,9 +13,17 @@ object Totals {
     private val assetTypes = setOf("ASSET", "BANK", "CASH", "RECEIVABLE")
     private val liabilityTypes = setOf("LIABILITY", "CREDIT", "PAYABLE")
 
-    fun balances(snapshot: BookSnapshot): Map<Guid, Money> {
+    /**
+     * Balances from every split whose transaction date falls within
+     * [from, to] (either bound omitted means unbounded on that side) --
+     * the same as-of/period convention the web and iOS reports use.
+     */
+    fun balances(snapshot: BookSnapshot, from: String? = null, to: String? = null): Map<Guid, Money> {
         val totals = mutableMapOf<Guid, Money>()
         for (transaction in snapshot.transactions) {
+            val day = transaction.date.take(10)
+            if (from != null && day < from) continue
+            if (to != null && day > to) continue
             for (split in transaction.splits) {
                 totals[split.accountGuid] = Money.add(totals[split.accountGuid] ?: Money.ZERO, split.value)
             }
@@ -24,8 +32,8 @@ object Totals {
     }
 
     /** Parent rows show their own balance plus every descendant. */
-    fun rolledUp(snapshot: BookSnapshot): Map<Guid, Money> {
-        val balances = balances(snapshot)
+    fun rolledUp(snapshot: BookSnapshot, from: String? = null, to: String? = null): Map<Guid, Money> {
+        val balances = balances(snapshot, from, to)
         val children = mutableMapOf<Guid, MutableList<Guid>>()
         for (account in snapshot.accounts) {
             val parent = account.parentGuid ?: continue
@@ -43,8 +51,8 @@ object Totals {
         return totals
     }
 
-    fun totals(snapshot: BookSnapshot): BookTotals {
-        val balances = balances(snapshot)
+    fun totals(snapshot: BookSnapshot, from: String? = null, to: String? = null): BookTotals {
+        val balances = balances(snapshot, from, to)
         var assets = Money.ZERO
         var liabilities = Money.ZERO
         var income = Money.ZERO

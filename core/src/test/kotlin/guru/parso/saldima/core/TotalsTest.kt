@@ -30,4 +30,25 @@ class TotalsTest {
         assertEquals(Money(2_500, 1), rolled[byName.getValue("Assets").guid])
         assertEquals(Money(-2_500, 1), rolled[byName.getValue("Income").guid])
     }
+
+    @Test
+    fun `balances and totals can be filtered to a period, as-of a date, or both unbounded`() {
+        val snapshot = XmlBookReader.read(File("../fixtures/books/oracle-mini.gnucash"))
+        val byName = snapshot.accounts.associateBy { it.name }
+        val bank = byName.getValue("Bank").guid
+
+        // The one posting is dated 2025-01-15.
+        assertEquals(Money(2_500, 1), Totals.balances(snapshot, to = "2025-01-15")[bank])
+        assertEquals(Money.ZERO, Totals.balances(snapshot, to = "2025-01-14")[bank] ?: Money.ZERO)
+        assertEquals(Money.ZERO, Totals.balances(snapshot, from = "2025-01-16")[bank] ?: Money.ZERO)
+        assertEquals(Money(2_500, 1), Totals.balances(snapshot, from = "2025-01-01", to = "2025-01-31")[bank])
+
+        val beforeHand = Totals.totals(snapshot, to = "2025-01-14")
+        assertEquals(Money.ZERO, beforeHand.assets)
+        val sameDay = Totals.totals(snapshot, to = "2025-01-15")
+        assertEquals(Money(2_500, 1), sameDay.assets)
+
+        val rolledBefore = Totals.rolledUp(snapshot, to = "2025-01-14")
+        assertEquals(Money.ZERO, rolledBefore[byName.getValue("Assets").guid] ?: Money.ZERO)
+    }
 }
