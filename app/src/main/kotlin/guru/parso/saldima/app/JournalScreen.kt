@@ -26,6 +26,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.toMutableStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -86,6 +87,9 @@ fun JournalScreen(repository: BookRepository) {
     }
 }
 
+/** Two splits cover a simple payment; up to four more are optional for entries with a tax or fee line. */
+private const val SPLIT_ROWS = 6
+
 @Composable
 private fun NewTransactionDialog(
     repository: BookRepository,
@@ -94,9 +98,8 @@ private fun NewTransactionDialog(
 ) {
     var date by remember { mutableStateOf(LocalDate.now().toString()) }
     var description by remember { mutableStateOf("") }
-    var from by remember { mutableStateOf<Guid?>(null) }
-    var to by remember { mutableStateOf<Guid?>(null) }
-    var amount by remember { mutableStateOf("") }
+    val splitAccounts = remember { (0 until SPLIT_ROWS).map { null as Guid? }.toMutableStateList() }
+    val splitAmounts = remember { (0 until SPLIT_ROWS).map { "" }.toMutableStateList() }
     var error by remember { mutableStateOf<String?>(null) }
 
     AlertDialog(
@@ -106,24 +109,48 @@ private fun NewTransactionDialog(
             Column {
                 OutlinedTextField(date, { date = it }, label = { Text("Date (YYYY-MM-DD)") }, singleLine = true)
                 OutlinedTextField(description, { description = it }, label = { Text("Description") }, singleLine = true)
-                AccountPicker("From", accounts, from) { from = it }
-                AccountPicker("To", accounts, to) { to = it }
-                OutlinedTextField(amount, { amount = it }, label = { Text("Amount") }, singleLine = true)
+                Text(
+                    "Each split takes a signed amount (debit positive, credit negative); the splits used must sum to zero.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                for (index in 0 until SPLIT_ROWS) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        AccountPicker(
+                            if (index < 2) "Account" else "Account (optional)",
+                            accounts,
+                            splitAccounts[index],
+                        ) { splitAccounts[index] = it }
+                        Spacer(Modifier.weight(1f))
+                        OutlinedTextField(
+                            splitAmounts[index],
+                            { splitAmounts[index] = it },
+                            label = { Text("Amount") },
+                            singleLine = true,
+                        )
+                    }
+                }
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             }
         },
         confirmButton = {
             TextButton(onClick = {
-                val source = from
-                val target = to
-                val cents = parseCents(amount)
+                val splits = (0 until SPLIT_ROWS).mapNotNull { index ->
+                    val account = splitAccounts[index]
+                    val text = splitAmounts[index]
+                    if (account == null && text.isBlank()) return@mapNotNull null
+                    val cents = parseCents(text)
+                    if (account == null || cents == null || cents == 0L) {
+                        error = "Fill in every split used: an account and a non-zero amount."
+                        return@TextButton
+                    }
+                    account to Money(cents, 100)
+                }
                 when {
-                    source == null || target == null || source == target -> error = "Choose two accounts."
                     description.isBlank() -> error = "Enter a description."
                     !Regex("^\\d{4}-\\d{2}-\\d{2}$").matches(date) -> error = "Use YYYY-MM-DD."
-                    cents == null || cents == 0L -> error = "Enter an amount like 12.34."
+                    splits.size < 2 -> error = "Use at least two splits."
                     else -> {
-                        repository.post(date, description.trim(), source, target, Money(cents, 100))
+                        repository.post(date, description.trim(), splits)
                         onDismiss()
                     }
                 }

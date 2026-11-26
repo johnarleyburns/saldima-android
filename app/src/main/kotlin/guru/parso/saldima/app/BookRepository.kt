@@ -168,6 +168,31 @@ class BookRepository(private val context: Context) {
         }
     }
 
+    fun updateAccount(guid: Guid, name: String, code: String, description: String) {
+        val file = currentFile ?: run {
+            error = "Open a book first."
+            return
+        }
+        if (name.isBlank()) {
+            error = "Enter a name."
+            return
+        }
+        var database: SQLiteDatabase? = null
+        try {
+            database = SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READWRITE)
+            database.execSQL(
+                "UPDATE accounts SET name = ?, code = ?, description = ? WHERE guid = ?",
+                arrayOf(name, code, description, guid.raw),
+            )
+            error = null
+            read(file)
+        } catch (failure: Exception) {
+            error = "Could not update account: ${failure.message}"
+        } finally {
+            database?.close()
+        }
+    }
+
     fun deleteAccount(guid: Guid) {
         val file = currentFile ?: run {
             error = "Open a book first."
@@ -198,7 +223,22 @@ class BookRepository(private val context: Context) {
         }
     }
 
-    fun post(date: String, description: String, from: Guid, to: Guid, amount: Money) {
+    /**
+     * Posts a transaction with two or more splits, each a signed amount
+     * (debit positive, credit negative); the splits used must sum to zero.
+     * Two legs cover a simple payment; more support entries with a tax or
+     * fee line (expense + input tax + payable, say).
+     */
+    fun post(date: String, description: String, splits: List<Pair<Guid, Money>>) {
+        if (splits.size < 2) {
+            error = "Use at least two splits."
+            return
+        }
+        val total = splits.fold(Money.ZERO) { sum, (_, value) -> Money.add(sum, value) }
+        if (total != Money.ZERO) {
+            error = "The splits must sum to zero."
+            return
+        }
         val file = currentFile ?: run {
             error = "Open a book first."
             return
@@ -211,7 +251,7 @@ class BookRepository(private val context: Context) {
                 "INSERT INTO transactions(guid, currency_guid, num, post_date, enter_date, description) VALUES (?, NULL, '', ?, ?, ?)",
                 arrayOf(tx, "$date 00:00:00", "$date 00:00:00", description),
             )
-            for ((account, value) in listOf(from to amount, to to Money(-amount.num, amount.denom))) {
+            for ((account, value) in splits) {
                 database.execSQL(
                     "INSERT INTO splits(guid, tx_guid, account_guid, memo, action, reconcile_state, reconcile_date, value_num, value_denom, quantity_num, quantity_denom, lot_guid) VALUES (?, ?, ?, '', '', 'n', NULL, ?, ?, ?, ?, NULL)",
                     arrayOf(
