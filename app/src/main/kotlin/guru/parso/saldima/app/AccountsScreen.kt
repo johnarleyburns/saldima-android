@@ -118,6 +118,7 @@ fun AccountsScreen(repository: BookRepository) {
 
         val rows = flatten(snapshot.accounts)
         var menuFor by remember { mutableStateOf<Guid?>(null) }
+        var editing by remember { mutableStateOf<SnapshotAccount?>(null) }
         LazyColumn(Modifier.fillMaxSize()) {
             items(rows.size) { index ->
                 val row = rows[index]
@@ -139,6 +140,13 @@ fun AccountsScreen(repository: BookRepository) {
                         onDismissRequest = { menuFor = null },
                     ) {
                         DropdownMenuItem(
+                            text = { Text("Edit account") },
+                            onClick = {
+                                editing = row.account
+                                menuFor = null
+                            },
+                        )
+                        DropdownMenuItem(
                             text = { Text("Delete account") },
                             onClick = {
                                 repository.deleteAccount(row.account.guid)
@@ -150,7 +158,52 @@ fun AccountsScreen(repository: BookRepository) {
                 androidx.compose.material3.HorizontalDivider()
             }
         }
+        editing?.let { account ->
+            EditAccountDialog(
+                account = account,
+                onDismiss = { editing = null },
+                onSave = { name, code, description ->
+                    repository.updateAccount(account.guid, name, code, description)
+                    editing = null
+                },
+            )
+        }
     }
+}
+
+@Composable
+private fun EditAccountDialog(
+    account: SnapshotAccount,
+    onDismiss: () -> Unit,
+    onSave: (name: String, code: String, description: String) -> Unit,
+) {
+    var name by remember { mutableStateOf(account.name) }
+    var code by remember { mutableStateOf(account.code) }
+    var description by remember { mutableStateOf(account.description) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Edit account") },
+        text = {
+            Column {
+                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Name") })
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(value = code, onValueChange = { code = it }, label = { Text("Code") })
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = description,
+                    onValueChange = { description = it },
+                    label = { Text("Description") },
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(name, code, description) }, enabled = name.isNotBlank()) {
+                Text("Save")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable
