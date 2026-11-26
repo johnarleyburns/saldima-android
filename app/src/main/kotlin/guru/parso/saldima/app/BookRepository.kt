@@ -260,6 +260,17 @@ class BookRepository(private val context: Context) {
         override fun insert(sql: String, params: List<Any?>) {
             database.execSQL(sql, params.toTypedArray())
         }
+
+        override fun <T> inTransaction(block: () -> T): T {
+            database.beginTransaction()
+            try {
+                val result = block()
+                database.setTransactionSuccessful()
+                return result
+            } finally {
+                database.endTransaction()
+            }
+        }
     }
 
     private class QueryRows(private val database: SQLiteDatabase) : SqliteRows {

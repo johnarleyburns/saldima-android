@@ -22,6 +22,21 @@ private class JdbcWrites(private val connection: Connection) : SqliteWrites {
             statement.executeUpdate()
         }
     }
+
+    override fun <T> inTransaction(block: () -> T): T {
+        val wasAutoCommit = connection.autoCommit
+        connection.autoCommit = false
+        try {
+            val result = block()
+            connection.commit()
+            return result
+        } catch (failure: Exception) {
+            connection.rollback()
+            throw failure
+        } finally {
+            connection.autoCommit = wasAutoCommit
+        }
+    }
 }
 
 private class JdbcRows(private val connection: Connection) : SqliteRows {
@@ -148,6 +163,25 @@ class SqliteBookWriterTest {
             )
             assertEquals(xmlSnapshot.transactions.size, reopened.transactions.size)
             assertTrue(reopened.transactions.first().splits.fold(Money.ZERO) { sum, split -> Money.add(sum, split.value) } == Money.ZERO)
+        }
+    }
+
+    @Test
+    fun `imports the real ~3,300-transaction synthetic ledger and reopens it`() {
+        val snapshot = XmlBookReader.read(File("../fixtures/books/gronewald-gl-2023-01.gnucash"))
+        assertEquals(3305, snapshot.transactions.size)
+
+        connect().use { connection ->
+            SqliteBookWriter.materialize(snapshot, JdbcWrites(connection), sequentialIds(start = 5000))
+            val reopened = SqliteBookReader.read(JdbcRows(connection))
+
+            assertEquals(24, reopened.accounts.size) // 22 real accounts + the book's own root + the template root
+            assertEquals(3305, reopened.transactions.size)
+            var total = Money.ZERO
+            for (transaction in reopened.transactions) {
+                for (split in transaction.splits) total = Money.add(total, split.value)
+            }
+            assertEquals(Money.ZERO, total)
         }
     }
 }
