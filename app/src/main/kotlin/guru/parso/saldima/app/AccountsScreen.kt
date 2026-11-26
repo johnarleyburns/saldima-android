@@ -16,12 +16,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -34,6 +37,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import guru.parso.saldima.core.AccountType
+import guru.parso.saldima.core.Guid
 import guru.parso.saldima.core.Money
 import guru.parso.saldima.core.SnapshotAccount
 import guru.parso.saldima.core.Totals
@@ -95,16 +99,31 @@ fun AccountsScreen(repository: BookRepository) {
             SummaryCard("Profit", bookTotals.profit, Modifier.weight(1f))
         }
         Spacer(Modifier.height(12.dp))
-        Button(onClick = { launcher.launch(arrayOf("*/*")) }) { Text("Open another book") }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = { launcher.launch(arrayOf("*/*")) }) { Text("Open another book") }
+            var adding by remember { mutableStateOf(false) }
+            Button(onClick = { adding = true }) { Text("Add account") }
+            if (adding) {
+                AddAccountDialog(
+                    accounts = snapshot.accounts,
+                    onDismiss = { adding = false },
+                    onCreate = { name, type, parent ->
+                        repository.createAccount(name, type, parent)
+                        adding = false
+                    },
+                )
+            }
+        }
         Spacer(Modifier.height(8.dp))
 
         val rows = flatten(snapshot.accounts)
+        var menuFor by remember { mutableStateOf<Guid?>(null) }
         LazyColumn(Modifier.fillMaxSize()) {
             items(rows.size) { index ->
                 val row = rows[index]
                 Row(
                     Modifier.fillMaxWidth()
-                        .clickable { }
+                        .clickable { menuFor = row.account.guid }
                         .padding(start = (row.depth * 16).dp, top = 10.dp, bottom = 10.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -115,11 +134,75 @@ fun AccountsScreen(repository: BookRepository) {
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold,
                     )
+                    DropdownMenu(
+                        expanded = menuFor == row.account.guid,
+                        onDismissRequest = { menuFor = null },
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Delete account") },
+                            onClick = {
+                                repository.deleteAccount(row.account.guid)
+                                menuFor = null
+                            },
+                        )
+                    }
                 }
                 androidx.compose.material3.HorizontalDivider()
             }
         }
     }
+}
+
+@Composable
+private fun AddAccountDialog(
+    accounts: List<SnapshotAccount>,
+    onDismiss: () -> Unit,
+    onCreate: (name: String, type: AccountType, parent: Guid) -> Unit,
+) {
+    var name by remember { mutableStateOf("") }
+    var typeExpanded by remember { mutableStateOf(false) }
+    var type by remember { mutableStateOf(AccountType.ASSET) }
+    var parentExpanded by remember { mutableStateOf(false) }
+    var parent by remember { mutableStateOf(accounts.firstOrNull()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Add account") },
+        text = {
+            Column {
+                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Name") })
+                Spacer(Modifier.height(8.dp))
+                Button(onClick = { typeExpanded = true }) { Text("Type: ${type.name}") }
+                DropdownMenu(expanded = typeExpanded, onDismissRequest = { typeExpanded = false }) {
+                    for (candidate in AccountType.entries) {
+                        DropdownMenuItem(
+                            text = { Text(candidate.name) },
+                            onClick = { type = candidate; typeExpanded = false },
+                        )
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Button(onClick = { parentExpanded = true }) {
+                    Text("Parent: ${parent?.name ?: "None"}")
+                }
+                DropdownMenu(expanded = parentExpanded, onDismissRequest = { parentExpanded = false }) {
+                    for (candidate in accounts) {
+                        DropdownMenuItem(
+                            text = { Text(candidate.name) },
+                            onClick = { parent = candidate; parentExpanded = false },
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { parent?.let { onCreate(name, type, it.guid) } },
+                enabled = name.isNotBlank() && parent != null,
+            ) { Text("Add") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable
