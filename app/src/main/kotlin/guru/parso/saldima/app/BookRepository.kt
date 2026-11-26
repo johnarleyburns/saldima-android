@@ -11,6 +11,7 @@ import guru.parso.saldima.core.AccountType
 import guru.parso.saldima.core.BookFiles
 import guru.parso.saldima.core.BookFormat
 import guru.parso.saldima.core.BookSnapshot
+import guru.parso.saldima.core.CustomerDraft
 import guru.parso.saldima.core.Guid
 import guru.parso.saldima.core.IdGenerator
 import guru.parso.saldima.core.Money
@@ -18,6 +19,9 @@ import guru.parso.saldima.core.SqliteBookReader
 import guru.parso.saldima.core.SqliteRows
 import guru.parso.saldima.core.Totals
 import guru.parso.saldima.core.XmlBookDocument
+import guru.parso.saldima.core.XmlCustomer
+import guru.parso.saldima.core.XmlInvoice
+import guru.parso.saldima.core.XmlInvoiceEntry
 import java.io.File
 import java.util.UUID
 
@@ -43,8 +47,13 @@ class BookRepository(private val context: Context) {
         private set
     var currentName by mutableStateOf<String?>(null)
         private set
+    var customers by mutableStateOf<List<XmlCustomer>>(emptyList())
+        private set
+    var invoices by mutableStateOf<List<XmlInvoice>>(emptyList())
+        private set
 
     private val directory: File get() = File(context.filesDir, "books").apply { mkdirs() }
+    private val receiptsDirectory: File get() = File(context.filesDir, "receipts").apply { mkdirs() }
     private var document: XmlBookDocument? = null
     private var currentFile: File? = null
     private val ids = IdGenerator {
@@ -246,6 +255,230 @@ class BookRepository(private val context: Context) {
         )
         snapshot = built
         totals = Totals.rolledUp(built)
+        customers = doc.customers().sortedBy { it.name.lowercase() }
+        invoices = doc.invoices().sortedByDescending { it.dateOpened }
+    }
+
+    // MARK: - Clients (GncCustomer)
+
+    fun invoiceEntries(invoiceGuid: Guid): List<XmlInvoiceEntry> = document?.invoiceEntries(invoiceGuid).orEmpty()
+
+    fun createCustomer(draft: CustomerDraft) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        if (draft.name.isBlank()) {
+            error = "Enter a name."
+            return
+        }
+        doc.createCustomer(ids.next(), draft, snapshot?.currencyCode ?: "USD")
+        error = null
+        save()
+    }
+
+    fun updateCustomer(guid: Guid, draft: CustomerDraft) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        if (draft.name.isBlank()) {
+            error = "Enter a name."
+            return
+        }
+        doc.updateCustomer(
+            guid,
+            name = draft.name,
+            customerNumber = draft.customerNumber,
+            addressLine1 = draft.addressLine1,
+            phone = draft.phone,
+            email = draft.email,
+            notes = draft.notes,
+        )
+        error = null
+        save()
+    }
+
+    fun deleteCustomer(guid: Guid) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        if (doc.customerInUse(guid)) {
+            error = "This client has invoices and cannot be deleted."
+            return
+        }
+        doc.deleteCustomer(guid)
+        error = null
+        save()
+    }
+
+    // MARK: - Invoices and lines (GncInvoice / GncEntry)
+
+    fun createInvoiceDraft(customerGuid: Guid, invoiceNumber: String, dateOpened: String): Guid? {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return null
+        }
+        if (invoiceNumber.isBlank()) {
+            error = "Enter an invoice number."
+            return null
+        }
+        val guid = ids.next()
+        doc.createInvoice(
+            guid,
+            customerGuid,
+            invoiceNumber = invoiceNumber,
+            dateOpened = dateOpened,
+            currencyCode = snapshot?.currencyCode ?: "USD",
+        )
+        error = null
+        save()
+        return guid
+    }
+
+    fun addInvoiceLine(
+        invoiceGuid: Guid,
+        date: String,
+        description: String,
+        quantity: Money,
+        unitPrice: Money,
+        incomeAccount: Guid,
+    ) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        val invoice = doc.invoice(invoiceGuid)
+        if (invoice == null || invoice.isPosted) {
+            error = "A posted invoice cannot be edited."
+            return
+        }
+        if (description.isBlank() || quantity == Money.ZERO || unitPrice == Money.ZERO) {
+            error = "Fill in a description and a non-zero quantity and unit price."
+            return
+        }
+        doc.addInvoiceEntry(ids.next(), invoiceGuid, date, description, quantity, unitPrice, incomeAccount)
+        error = null
+        save()
+    }
+
+    fun deleteInvoiceLine(invoiceGuid: Guid, lineGuid: Guid) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        val invoice = doc.invoice(invoiceGuid)
+        if (invoice == null || invoice.isPosted) {
+            error = "A posted invoice cannot be edited."
+            return
+        }
+        doc.deleteInvoiceEntry(lineGuid)
+        error = null
+        save()
+    }
+
+    fun deleteInvoiceDraft(invoiceGuid: Guid) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        val invoice = doc.invoice(invoiceGuid)
+        if (invoice == null || invoice.isPosted) {
+            error = "A posted invoice cannot be deleted."
+            return
+        }
+        doc.deleteInvoice(invoiceGuid)
+        error = null
+        save()
+    }
+
+    /**
+     * Posts a draft invoice: debits the chosen receivable account for the
+     * total and credits each line's income account -- the same effect as
+     * desktop GnuCash's own "Post Invoice". One-way: a posted invoice is
+     * permanent ledger history and can no longer be edited or deleted.
+     */
+    fun postInvoice(invoiceGuid: Guid, receivableAccount: Guid, postedDate: String) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        val invoice = doc.invoice(invoiceGuid)
+        if (invoice == null || invoice.isPosted) {
+            error = "This invoice is already posted."
+            return
+        }
+        val entries = doc.invoiceEntries(invoiceGuid)
+        if (entries.isEmpty()) {
+            error = "Add at least one line before posting."
+            return
+        }
+        var total = Money.ZERO
+        val splits = entries.map { entry ->
+            total = Money.add(total, entry.amount)
+            Triple(entry.incomeAccountGuid, entry.amount.negated(), ids.next())
+        } + Triple(receivableAccount, total, ids.next())
+        val txGuid = ids.next()
+        doc.postTransaction(txGuid, postedDate, "Invoice ${invoice.invoiceNumber}", splits)
+        doc.markInvoicePosted(invoiceGuid, postedDate, txGuid, receivableAccount)
+        error = null
+        save()
+    }
+
+    // MARK: - Receipts (GnuCash "Associate File/Location")
+
+    /** Captures a receipt image on-device and posts the expense it documents. */
+    fun postReceiptExpense(
+        bytes: ByteArray,
+        extension: String,
+        date: String,
+        description: String,
+        amount: Money,
+        expenseAccount: Guid,
+        paymentAccount: Guid,
+    ) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        if (description.isBlank() || amount == Money.ZERO) {
+            error = "Fill in a description and a non-zero amount."
+            return
+        }
+        val relativePath = "receipts/${UUID.randomUUID()}.$extension"
+        File(receiptsDirectory, relativePath.removePrefix("receipts/")).writeBytes(bytes)
+        val txGuid = ids.next()
+        doc.postTransaction(
+            guid = txGuid,
+            date = date,
+            description = description,
+            splits = listOf(
+                Triple(expenseAccount, amount, ids.next()),
+                Triple(paymentAccount, amount.negated(), ids.next()),
+            ),
+        )
+        doc.setTransactionDocLink(txGuid, relativePath)
+        error = null
+        save()
+    }
+
+    fun receiptImage(relativePath: String): ByteArray? {
+        val file = File(receiptsDirectory, relativePath.removePrefix("receipts/"))
+        return if (file.exists()) file.readBytes() else null
+    }
+
+    // MARK: - Reconcile
+
+    /** The same action as checking a row off in GnuCash's Reconcile window. */
+    fun setSplitReconcileState(transactionGuid: Guid, splitGuid: Guid, state: String, reconcileDate: String? = null) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        doc.setSplitReconcileState(transactionGuid, splitGuid, state, reconcileDate)
+        error = null
+        save()
     }
 
     /**
