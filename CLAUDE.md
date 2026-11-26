@@ -12,11 +12,17 @@ our name or logo.
 
 ## Sources of truth
 
-1. `docs/spec/SPEC.md` and `docs/spec/DESIGN.md` copied from the web repo at the
-   pinned commit (see `docs/vectors.md`).
-2. `saldima-ios/CLAUDE.md` and the iOS plan; Android should reach feature parity.
-3. This file and `docs/plans/P0.md`.
-4. The GitHub issue being worked.
+1. `docs/architecture/TECHNICAL-DESIGN.md` — the current architecture
+   baseline (mirrors the web repo's copy). GnuCash XML is the canonical
+   book format; SQLite is for import/export of a desktop SQLite-dialect
+   file only, never the live store. Zero-knowledge sync is a later,
+   deferred phase. See `docs/plans/P0.md` risks for the migration's phasing.
+2. `docs/spec/SPEC.md` and `docs/spec/DESIGN.md` copied from the web repo at the
+   pinned commit (see `docs/vectors.md`) for product/accounting behaviour;
+   their storage/encryption passages are superseded by (1).
+3. `saldima-ios/CLAUDE.md` and the iOS plan; Android should reach feature parity.
+4. This file and `docs/plans/P0.md`.
+5. The GitHub issue being worked.
 
 Stop and ask if a decision is missing; never guess.
 
@@ -31,9 +37,14 @@ Stop and ask if a decision is missing; never guess.
   standalone mode.
 - **`:app`**: Compose UI, SQLite book storage, Billing adapter, Keychain-equivalent
   encrypted token storage (Android Keystore).
-- **Persistence:** hand-rolled `SQLiteOpenHelper`/`SQLiteDatabase` over the
-  GnuCash tables with numbered migrations. No Room, no ORM rewriting GnuCash
-  tables.
+- **Persistence (migrating — see `docs/architecture/TECHNICAL-DESIGN.md`):**
+  target is GnuCash XML as the sole canonical on-disk book; SQLite is an
+  import/export adapter only (reading a desktop SQLite-dialect file to
+  convert into the internal XML model, or writing one on export), never the
+  live store. Until that migration lands, the running app still uses a
+  hand-rolled `SQLiteOpenHelper`/`SQLiteDatabase` over the GnuCash tables
+  with numbered migrations as the live store — do not build new accounting
+  features against it. No Room, no ORM rewriting GnuCash tables.
 - **Purchases:** Google Play Billing one-time **consumable** `saldima_supporter`.
   It never gates a feature; it sets a one-way local Supporter flag/badge, just
   like Voxglass. No subscription. Hosting is bought on the web.
