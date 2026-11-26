@@ -41,6 +41,7 @@ import guru.parso.saldima.core.Guid
 import guru.parso.saldima.core.Money
 import guru.parso.saldima.core.SnapshotAccount
 import guru.parso.saldima.core.Totals
+import java.time.LocalDate
 
 private data class Row(val account: SnapshotAccount, val depth: Int)
 
@@ -119,6 +120,7 @@ fun AccountsScreen(repository: BookRepository) {
         val rows = flatten(snapshot.accounts)
         var menuFor by remember { mutableStateOf<Guid?>(null) }
         var editing by remember { mutableStateOf<SnapshotAccount?>(null) }
+        var reconciling by remember { mutableStateOf<SnapshotAccount?>(null) }
         LazyColumn(Modifier.fillMaxSize()) {
             items(rows.size) { index ->
                 val row = rows[index]
@@ -153,6 +155,13 @@ fun AccountsScreen(repository: BookRepository) {
                                 menuFor = null
                             },
                         )
+                        DropdownMenuItem(
+                            text = { Text("Reconcile") },
+                            onClick = {
+                                reconciling = row.account
+                                menuFor = null
+                            },
+                        )
                     }
                 }
                 androidx.compose.material3.HorizontalDivider()
@@ -168,7 +177,114 @@ fun AccountsScreen(repository: BookRepository) {
                 },
             )
         }
+        reconciling?.let { account ->
+            ReconcileDialog(repository, account, onDismiss = { reconciling = null })
+        }
     }
+}
+
+/**
+ * The same action as desktop GnuCash's Reconcile window: check off every
+ * split that appears on the bank statement, then finish once the cleared
+ * total matches the statement's ending balance -- distinct from bank
+ * integration/auto-feeds, which stays out of scope.
+ */
+@Composable
+private fun ReconcileDialog(repository: BookRepository, account: SnapshotAccount, onDismiss: () -> Unit) {
+    val snapshot = repository.snapshot
+    var statementDate by remember { mutableStateOf(LocalDate.now().toString()) }
+    var statementBalance by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    val rows = remember(snapshot) {
+        (snapshot?.transactions ?: emptyList()).flatMap { transaction ->
+            transaction.splits
+                .filter { it.accountGuid == account.guid && it.reconcileState != "y" }
+                .mapNotNull { split -> split.guid?.let { Triple(transaction, it, split.value) } }
+        }
+    }
+    val states = remember(snapshot, account.guid) {
+        (snapshot?.transactions ?: emptyList()).flatMap { transaction ->
+            transaction.splits.filter { it.accountGuid == account.guid }
+        }.associateBy { it.guid }
+    }
+    val cleared = rows.filter { (_, splitGuid, _) -> states[splitGuid]?.reconcileState == "c" }
+    val clearedTotal = cleared.fold(Money.ZERO) { sum, (_, _, value) -> Money.add(sum, value) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Reconcile ${account.name}") },
+        text = {
+            Column {
+                Text(
+                    "Check off every transaction that appears on your statement. The cleared total must match the statement's ending balance before you can finish.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    statementDate,
+                    { statementDate = it },
+                    label = { Text("Statement date") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    statementBalance,
+                    { statementBalance = it },
+                    label = { Text("Statement ending balance") },
+                    singleLine = true,
+                )
+                Text("Cleared total so far: ${clearedTotal.formatted(100)}", style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(8.dp))
+                if (rows.isEmpty()) {
+                    Text("Nothing left to reconcile.", style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    for ((transaction, splitGuid, value) in rows) {
+                        val checked = states[splitGuid]?.reconcileState == "c"
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            androidx.compose.material3.Checkbox(
+                                checked = checked,
+                                onCheckedChange = { isChecked ->
+                                    repository.setSplitReconcileState(
+                                        transaction.guid,
+                                        splitGuid,
+                                        if (isChecked) "c" else "n",
+                                    )
+                                },
+                            )
+                            Text("${transaction.date} · ${transaction.description}")
+                            Spacer(Modifier.weight(1f))
+                            Text(value.formatted(100))
+                        }
+                    }
+                }
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val cents = parseCents(statementBalance)
+                if (!Regex("^\\d{4}-\\d{2}-\\d{2}$").matches(statementDate)) {
+                    error = "Enter a valid statement date to finish."
+                    return@TextButton
+                }
+                if (cents == null) {
+                    error = "Enter amounts like 1234.56 or -1234.56."
+                    return@TextButton
+                }
+                val target = Money(cents, 100)
+                if (Money.subtract(clearedTotal, target) != Money.ZERO) {
+                    error =
+                        "Not balanced yet: cleared total is ${clearedTotal.formatted(100)}, statement balance is ${target.formatted(100)}."
+                    return@TextButton
+                }
+                for ((transaction, splitGuid, _) in cleared) {
+                    repository.setSplitReconcileState(transaction.guid, splitGuid, "y", statementDate)
+                }
+                onDismiss()
+            }) { Text("Finish reconciling") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
 }
 
 @Composable
@@ -281,6 +397,15 @@ private fun SummaryCard(label: String, value: Money, modifier: Modifier = Modifi
             )
         }
     }
+}
+
+private fun parseCents(text: String): Long? {
+    val pieces = text.trim().split('.')
+    if (pieces.size > 2) return null
+    val whole = pieces[0].toLongOrNull() ?: return null
+    val fraction = pieces.getOrNull(1)?.padEnd(2, '0')?.take(2)?.toLongOrNull() ?: 0L
+    if (pieces.size == 2 && pieces[1].length > 2) return null
+    return whole * 100 + fraction
 }
 
 private fun flatten(accounts: List<SnapshotAccount>): List<Row> {
