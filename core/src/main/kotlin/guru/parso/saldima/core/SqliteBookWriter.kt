@@ -2,15 +2,19 @@
 package guru.parso.saldima.core
 
 /**
- * The two write operations materializing a book needs; the app supplies
+ * The write operations materializing a book needs; the app supplies
  * android.database.sqlite execution (`:core:test` uses a real JVM SQLite
  * engine, so this stays pure JVM and testable without Android or an
- * Android-specific driver). Each call is exactly one statement: Android's
- * `SQLiteDatabase.execSQL`/`insert` never run more than one per call.
+ * Android-specific driver). Each `exec`/`insert` call is exactly one
+ * statement: Android's `SQLiteDatabase.execSQL`/`insert` never run more than
+ * one per call. `inTransaction` must wrap its block in a single transaction
+ * (SQLite commits every statement individually otherwise, which is orders of
+ * magnitude slower for a book with thousands of transactions).
  */
 interface SqliteWrites {
     fun exec(sql: String)
     fun insert(sql: String, params: List<Any?>)
+    fun <T> inTransaction(block: () -> T): T
 }
 
 /**
@@ -34,52 +38,59 @@ object SqliteBookWriter {
         }
     }
 
-    /** Materializes `snapshot` as a brand-new book; `writes` must be an empty database. */
+    /**
+     * Materializes `snapshot` as a brand-new book; `writes` must be an empty
+     * database. Runs as a single transaction: committing every one of the
+     * (possibly thousands of) statements individually is orders of magnitude
+     * slower.
+     */
     fun materialize(snapshot: BookSnapshot, writes: SqliteWrites, ids: IdGenerator) {
         require(snapshot.accounts.isNotEmpty()) { "book has no accounts" }
-        createSchema(writes)
+        writes.inTransaction {
+            createSchema(writes)
 
-        val currencyCode = snapshot.currencyCode ?: "USD"
-        val fraction = snapshot.fraction ?: 100L
-        val commodityGuid = ids.next()
-        writes.insert(
-            """
-            INSERT INTO commodities(
-                guid, namespace, mnemonic, fullname, cusip, fraction,
-                quote_flag, quote_source, quote_tz
-            ) VALUES (?, 'CURRENCY', ?, ?, NULL, ?, 1, 'currency', NULL);
-            """.trimIndent(),
-            listOf(commodityGuid.raw, currencyCode, currencyCode, fraction),
-        )
-
-        val rootAccount = snapshot.accounts.firstOrNull { it.type == "ROOT" }
-        val rootGuid = rootAccount?.guid ?: ids.next()
-        val templateRootGuid = ids.next()
-        insertAccount(writes, rootGuid, rootAccount?.name ?: "Root Account", "ROOT", null, null, false, false)
-        insertAccount(writes, templateRootGuid, "Template Root", "ROOT", null, null, false, false)
-        writes.insert(
-            "INSERT INTO books(guid, root_account_guid, root_template_guid) VALUES (?, ?, ?);",
-            listOf(snapshot.bookGuid.raw, rootGuid.raw, templateRootGuid.raw),
-        )
-
-        for (account in snapshot.accounts) {
-            if (account.guid == rootGuid) continue
-            insertAccount(
-                writes,
-                account.guid,
-                account.name,
-                account.type,
-                commodityGuid,
-                account.parentGuid ?: rootGuid,
-                account.hidden,
-                account.placeholder,
-                account.code,
-                account.description,
+            val currencyCode = snapshot.currencyCode ?: "USD"
+            val fraction = snapshot.fraction ?: 100L
+            val commodityGuid = ids.next()
+            writes.insert(
+                """
+                INSERT INTO commodities(
+                    guid, namespace, mnemonic, fullname, cusip, fraction,
+                    quote_flag, quote_source, quote_tz
+                ) VALUES (?, 'CURRENCY', ?, ?, NULL, ?, 1, 'currency', NULL);
+                """.trimIndent(),
+                listOf(commodityGuid.raw, currencyCode, currencyCode, fraction),
             )
-        }
 
-        for (transaction in snapshot.transactions) {
-            insertTransaction(writes, transaction, commodityGuid, ids)
+            val rootAccount = snapshot.accounts.firstOrNull { it.type == "ROOT" }
+            val rootGuid = rootAccount?.guid ?: ids.next()
+            val templateRootGuid = ids.next()
+            insertAccount(writes, rootGuid, rootAccount?.name ?: "Root Account", "ROOT", null, null, false, false)
+            insertAccount(writes, templateRootGuid, "Template Root", "ROOT", null, null, false, false)
+            writes.insert(
+                "INSERT INTO books(guid, root_account_guid, root_template_guid) VALUES (?, ?, ?);",
+                listOf(snapshot.bookGuid.raw, rootGuid.raw, templateRootGuid.raw),
+            )
+
+            for (account in snapshot.accounts) {
+                if (account.guid == rootGuid) continue
+                insertAccount(
+                    writes,
+                    account.guid,
+                    account.name,
+                    account.type,
+                    commodityGuid,
+                    account.parentGuid ?: rootGuid,
+                    account.hidden,
+                    account.placeholder,
+                    account.code,
+                    account.description,
+                )
+            }
+
+            for (transaction in snapshot.transactions) {
+                insertTransaction(writes, transaction, commodityGuid, ids)
+            }
         }
     }
 
