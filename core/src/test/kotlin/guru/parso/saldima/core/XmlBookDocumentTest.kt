@@ -217,6 +217,85 @@ class XmlBookDocumentTest {
     }
 
     @Test
+    fun `voids a transaction, zeroing its effect on balances without deleting it, then unvoids it`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        val txGuid = Guid.parse("2".repeat(32))
+        val bankSplit = Guid.parse("3".repeat(32))
+        val salarySplit = Guid.parse("4".repeat(32))
+        document.postTransaction(
+            guid = txGuid,
+            date = "2026-02-01",
+            description = "Coffee",
+            splits = listOf(Triple(bank, Money(-500, 100), bankSplit), Triple(salary, Money(500, 100), salarySplit)),
+        )
+        document.setSplitReconcileState(txGuid, bankSplit, "c")
+        val bankBalanceBeforeVoid = assertNotNull(document.balances()[bank])
+
+        document.voidTransaction(txGuid, "Entered in error", "2026-02-10 00:00:00 +0000")
+        val voided = assertNotNull(document.transaction(txGuid))
+        assertTrue(voided.voided)
+        assertEquals("Entered in error", voided.voidReason)
+        assertEquals("2026-02-10 00:00:00 +0000", voided.voidTime)
+        val voidedSplit = voided.splits.first { it.guid == bankSplit }
+        assertEquals(Money(0, 100), voidedSplit.value)
+        assertEquals("v", voidedSplit.reconcileState)
+        assertEquals(Money(-500, 100), voidedSplit.voidFormerValue)
+
+        // Zeroed, so it no longer contributes to the balance -- the fixture's
+        // own pre-existing "Opening deposit" transaction still does.
+        val bankBalanceAfterVoid = assertNotNull(document.balances()[bank])
+        assertEquals(Money.add(bankBalanceBeforeVoid, Money(500, 100)), bankBalanceAfterVoid)
+
+        val reparsed = XmlBookDocument.parse(document.serialize())
+        val reparsedVoided = assertNotNull(reparsed.transaction(txGuid))
+        assertTrue(reparsedVoided.voided)
+        assertEquals(Money(0, 100), reparsedVoided.splits.first { it.guid == bankSplit }.value)
+
+        document.unvoidTransaction(txGuid)
+        val unvoided = assertNotNull(document.transaction(txGuid))
+        assertFalse(unvoided.voided)
+        assertNull(unvoided.voidReason)
+        val unvoidedSplit = unvoided.splits.first { it.guid == bankSplit }
+        assertEquals(Money(-500, 100), unvoidedSplit.value)
+        assertEquals("n", unvoidedSplit.reconcileState)
+        assertNull(unvoidedSplit.voidFormerValue)
+    }
+
+    @Test
+    fun `refuses to void an already-voided transaction, an unknown one, or a blank reason, and refuses to unvoid an unvoided one`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        val txGuid = Guid.parse("2".repeat(32))
+        document.postTransaction(
+            guid = txGuid,
+            date = "2026-02-01",
+            description = "Coffee",
+            splits = listOf(
+                Triple(bank, Money(-500, 100), Guid.parse("3".repeat(32))),
+                Triple(salary, Money(500, 100), Guid.parse("4".repeat(32))),
+            ),
+        )
+        val unknown = Guid.parse("f".repeat(32))
+
+        assertFailsWith<BookFormatException> {
+            document.voidTransaction(unknown, "x", "2026-02-10 00:00:00 +0000")
+        }
+        assertFailsWith<BookFormatException> {
+            document.voidTransaction(txGuid, "   ", "2026-02-10 00:00:00 +0000")
+        }
+        assertFailsWith<BookFormatException> { document.unvoidTransaction(txGuid) }
+
+        document.voidTransaction(txGuid, "Entered in error", "2026-02-10 00:00:00 +0000")
+        assertFailsWith<BookFormatException> {
+            document.voidTransaction(txGuid, "Again", "2026-02-11 00:00:00 +0000")
+        }
+        assertFailsWith<BookFormatException> { document.unvoidTransaction(unknown) }
+    }
+
+    @Test
     fun `attaches, updates and clears a receipt doc-link on a posted transaction`() {
         val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
         val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)

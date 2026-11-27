@@ -18,10 +18,12 @@ data class SnapshotSplit(
     val accountGuid: Guid,
     val value: Money,
     val guid: Guid? = null,
-    /** `"n"` not reconciled, `"c"` cleared, `"y"` reconciled -- GnuCash's own codes. */
+    /** `"n"` not reconciled, `"c"` cleared, `"y"` reconciled, `"v"` voided -- GnuCash's own codes. */
     val reconcileState: String = "n",
     /** Set only once `reconcileState` is `"y"`; `YYYY-MM-DD HH:MM:SS +ZZZZ`. */
     val reconcileDate: String? = null,
+    /** Pre-void value, set only while the parent transaction is voided. */
+    val voidFormerValue: Money? = null,
 )
 
 data class SnapshotTransaction(
@@ -36,6 +38,11 @@ data class SnapshotTransaction(
      * is there.
      */
     val docLink: String? = null,
+    /** True once `voidTransaction` has run; every split's value is zeroed. */
+    val voided: Boolean = false,
+    val voidReason: String? = null,
+    /** `YYYY-MM-DD HH:MM:SS +ZZZZ`, set only while voided. */
+    val voidTime: String? = null,
 )
 
 data class BookSnapshot(

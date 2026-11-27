@@ -406,12 +406,23 @@ class XmlBookDocument private constructor(
             val splitGuid = guidValue(splitNode, "id")
             val reconcileState = firstChild(splitNode, "reconciled-state")?.text?.ifEmpty { null } ?: "n"
             val reconcileDate = firstChild(splitNode, "reconcile-date")?.let { firstChild(it, "date")?.text }
-            SnapshotSplit(account, value, splitGuid, reconcileState, reconcileDate)
+            val voidFormerValue = readNumericSlot(splitNode, "void-former-value")
+            SnapshotSplit(account, value, splitGuid, reconcileState, reconcileDate, voidFormerValue)
         }
         val docLink = firstChild(node, "slots")
             ?.let { slots -> children(slots, "slot").firstOrNull { firstChild(it, "key")?.text == "assoc_uri" } }
             ?.let { firstChild(it, "value")?.text }
-        return SnapshotTransaction(guid, date, description, currency, splits, docLink)
+        return SnapshotTransaction(
+            guid,
+            date,
+            description,
+            currency,
+            splits,
+            docLink,
+            voided = readStringSlot(node, "void-time") != null,
+            voidReason = readStringSlot(node, "void-reason"),
+            voidTime = readStringSlot(node, "void-time"),
+        )
     }
 
     /**
@@ -471,6 +482,100 @@ class XmlBookDocument private constructor(
             existing?.detach()
         }
         if (slots.children.isEmpty()) slots.detach()
+    }
+
+    /**
+     * Voids a transaction exactly like desktop GnuCash's own `xaccTransVoid`:
+     * every split's value and quantity is preserved in a `void-former-*`
+     * slot, then zeroed (so the transaction stops affecting any balance
+     * without being deleted), every split is marked `"v"`, and the
+     * transaction's notes/void-reason/void-time slots record why and when.
+     * Refuses to void an already-voided transaction.
+     */
+    fun voidTransaction(transactionGuid: Guid, reason: String, voidTime: String) {
+        val transactionNode = transactionIndex[transactionGuid]
+            ?: throw BookFormatException("unknown transaction ${transactionGuid.raw}")
+        if (reason.isBlank()) {
+            throw BookFormatException("a reason is required to void a transaction")
+        }
+        if (readStringSlot(transactionNode, "void-time") != null) {
+            throw BookFormatException("transaction ${transactionGuid.raw} is already voided")
+        }
+
+        var slots = firstChild(transactionNode, "slots")
+        if (slots == null) {
+            slots = XmlNode("trn:slots")
+            transactionNode.addChild(slots)
+        }
+        readStringSlot(transactionNode, "notes")?.let { setStringSlot(slots, "void-former-notes", it) }
+        setStringSlot(slots, "notes", "Voided transaction")
+        setStringSlot(slots, "void-reason", reason)
+        setStringSlot(slots, "void-time", voidTime)
+        setStringSlot(slots, "trans-read-only", "Transaction Voided")
+
+        val splitsContainer = firstChild(transactionNode, "splits") ?: transactionNode
+        for (splitNode in children(splitsContainer, "split")) {
+            val valueText = firstChild(splitNode, "value")?.text ?: continue
+            val value = rational(valueText) ?: continue
+            val quantityText = firstChild(splitNode, "quantity")?.text ?: valueText
+            val quantity = rational(quantityText) ?: value
+            var splitSlots = firstChild(splitNode, "slots")
+            if (splitSlots == null) {
+                splitSlots = XmlNode("split:slots")
+                splitNode.addChild(splitSlots)
+            }
+            setNumericSlot(splitSlots, "void-former-value", value)
+            setNumericSlot(splitSlots, "void-former-amount", quantity)
+            setChildText(splitNode, "value", "split:value", "0/${value.denom}")
+            setChildText(splitNode, "quantity", "split:quantity", "0/${quantity.denom}")
+            setChildText(splitNode, "reconciled-state", "split:reconciled-state", "v")
+        }
+    }
+
+    /**
+     * Reverses `voidTransaction`: restores every split's original
+     * value/quantity and reconcile state (always back to `"n"`, matching
+     * desktop GnuCash -- a split's reconciled state before voiding is not
+     * preserved), restores the transaction's notes, and clears every
+     * void-related slot. Refuses a transaction that isn't voided.
+     */
+    fun unvoidTransaction(transactionGuid: Guid) {
+        val transactionNode = transactionIndex[transactionGuid]
+            ?: throw BookFormatException("unknown transaction ${transactionGuid.raw}")
+        if (readStringSlot(transactionNode, "void-time") == null) {
+            throw BookFormatException("transaction ${transactionGuid.raw} is not voided")
+        }
+
+        var slots = firstChild(transactionNode, "slots")
+        if (slots == null) {
+            slots = XmlNode("trn:slots")
+            transactionNode.addChild(slots)
+        }
+        setStringSlot(slots, "notes", readStringSlot(transactionNode, "void-former-notes"))
+        setStringSlot(slots, "void-former-notes", null)
+        setStringSlot(slots, "void-reason", null)
+        setStringSlot(slots, "void-time", null)
+        setStringSlot(slots, "trans-read-only", null)
+        if (slots.children.isEmpty()) slots.detach()
+
+        val splitsContainer = firstChild(transactionNode, "splits") ?: transactionNode
+        for (splitNode in children(splitsContainer, "split")) {
+            val formerValue = readNumericSlot(splitNode, "void-former-value")
+            val formerQuantity = readNumericSlot(splitNode, "void-former-amount")
+            if (formerValue != null) {
+                setChildText(splitNode, "value", "split:value", "${formerValue.num}/${formerValue.denom}")
+            }
+            if (formerQuantity != null) {
+                setChildText(splitNode, "quantity", "split:quantity", "${formerQuantity.num}/${formerQuantity.denom}")
+            }
+            setChildText(splitNode, "reconciled-state", "split:reconciled-state", "n")
+            val splitSlots = firstChild(splitNode, "slots")
+            if (splitSlots != null) {
+                setNumericSlot(splitSlots, "void-former-value", null)
+                setNumericSlot(splitSlots, "void-former-amount", null)
+                if (splitSlots.children.isEmpty()) splitSlots.detach()
+            }
+        }
     }
 
     /** Sums each account's split value (the book currency amount); not rolled up to parents. */
@@ -552,6 +657,55 @@ class XmlBookDocument private constructor(
 
     fun splitCount(forAccount: Guid): Int =
         transactions().sumOf { transaction -> transaction.splits.count { it.accountGuid == forAccount } }
+
+    private fun findSlot(slots: XmlNode, key: String): XmlNode? =
+        children(slots, "slot").firstOrNull { firstChild(it, "key")?.text == key }
+
+    private fun readStringSlot(owner: XmlNode, key: String): String? {
+        val slots = firstChild(owner, "slots") ?: return null
+        val slot = findSlot(slots, key) ?: return null
+        return firstChild(slot, "value")?.text
+    }
+
+    private fun setStringSlot(slots: XmlNode, key: String, value: String?) {
+        val existing = findSlot(slots, key)
+        if (value == null) {
+            existing?.detach()
+            return
+        }
+        if (existing != null) {
+            firstChild(existing, "value")?.let { it.text = value }
+            return
+        }
+        val slot = XmlNode("slot")
+        slot.addChild(leaf("slot:key", key))
+        slot.addChild(leaf("slot:value", value, "type" to "string"))
+        slots.addChild(slot)
+    }
+
+    private fun readNumericSlot(owner: XmlNode, key: String): Money? {
+        val slots = firstChild(owner, "slots") ?: return null
+        val slot = findSlot(slots, key) ?: return null
+        val valueNode = firstChild(slot, "value") ?: return null
+        return rational(valueNode.text)
+    }
+
+    private fun setNumericSlot(slots: XmlNode, key: String, value: Money?) {
+        val existing = findSlot(slots, key)
+        if (value == null) {
+            existing?.detach()
+            return
+        }
+        val valueText = "${value.num}/${value.denom}"
+        if (existing != null) {
+            firstChild(existing, "value")?.let { it.text = valueText }
+            return
+        }
+        val slot = XmlNode("slot")
+        slot.addChild(leaf("slot:key", key))
+        slot.addChild(leaf("slot:value", valueText, "type" to "numeric"))
+        slots.addChild(slot)
+    }
 
     private fun setBooleanSlot(slots: XmlNode, key: String, value: Boolean) {
         val existing = children(slots, "slot").firstOrNull { firstChild(it, "key")?.text == key }
