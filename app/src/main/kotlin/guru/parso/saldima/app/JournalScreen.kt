@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -19,6 +20,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -40,6 +42,7 @@ import java.time.LocalDate
 fun JournalScreen(repository: BookRepository) {
     LaunchedEffect(Unit) { repository.loadExisting() }
     var composing by remember { mutableStateOf(false) }
+    var voidingTransaction by remember { mutableStateOf<guru.parso.saldima.core.SnapshotTransaction?>(null) }
     val snapshot = repository.snapshot
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text("Register", style = MaterialTheme.typography.headlineMedium)
@@ -65,8 +68,26 @@ fun JournalScreen(repository: BookRepository) {
                     Column(Modifier.padding(12.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(transaction.description, fontWeight = FontWeight.SemiBold)
+                            if (transaction.voided) {
+                                Spacer(Modifier.width(8.dp))
+                                Surface(color = MaterialTheme.colorScheme.errorContainer) {
+                                    Text(
+                                        "VOID",
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                    )
+                                }
+                            }
                             Spacer(Modifier.weight(1f))
                             Text(transaction.date, style = MaterialTheme.typography.labelMedium)
+                        }
+                        transaction.voidReason?.let {
+                            Text(
+                                "Voided: $it",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
                         Spacer(Modifier.height(6.dp))
                         for (split in transaction.splits) {
@@ -74,6 +95,17 @@ fun JournalScreen(repository: BookRepository) {
                                 Text(names[split.accountGuid] ?: "Account", style = MaterialTheme.typography.bodyMedium)
                                 Spacer(Modifier.weight(1f))
                                 Text(split.value.formatted(100), style = MaterialTheme.typography.bodyMedium)
+                            }
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Row {
+                            Spacer(Modifier.weight(1f))
+                            if (transaction.voided) {
+                                TextButton(onClick = { repository.unvoidTransaction(transaction.guid) }) {
+                                    Text("Unvoid")
+                                }
+                            } else {
+                                TextButton(onClick = { voidingTransaction = transaction }) { Text("Void") }
                             }
                         }
                     }
@@ -85,6 +117,43 @@ fun JournalScreen(repository: BookRepository) {
     if (composing && snapshot != null) {
         NewTransactionDialog(repository, snapshot.accounts, onDismiss = { composing = false })
     }
+
+    voidingTransaction?.let { transaction ->
+        VoidTransactionDialog(
+            repository = repository,
+            transaction = transaction,
+            onDismiss = { voidingTransaction = null },
+        )
+    }
+}
+
+@Composable
+private fun VoidTransactionDialog(
+    repository: BookRepository,
+    transaction: guru.parso.saldima.core.SnapshotTransaction,
+    onDismiss: () -> Unit,
+) {
+    var reason by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Void transaction") },
+        text = {
+            Column {
+                Text(
+                    "The transaction stays in the register for audit, but no longer affects any balance.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedTextField(reason, { reason = it }, label = { Text("Reason") }, singleLine = true)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                repository.voidTransaction(transaction.guid, reason, LocalDate.now().toString())
+                onDismiss()
+            }) { Text("Void") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 /** Two splits cover a simple payment; up to four more are optional for entries with a tax or fee line. */

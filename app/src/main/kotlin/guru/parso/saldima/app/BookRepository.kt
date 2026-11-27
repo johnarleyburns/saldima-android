@@ -660,6 +660,53 @@ class BookRepository(private val context: Context) {
     }
 
     /**
+     * Voids a transaction (GnuCash's "Void Transaction", not a delete): the
+     * original splits are preserved for audit but zeroed, so the
+     * transaction stops affecting any balance. Can be reversed with
+     * [unvoidTransaction].
+     */
+    fun voidTransaction(transactionGuid: Guid, reason: String, voidTime: String) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        val transaction = doc.transaction(transactionGuid) ?: run {
+            error = "That transaction is no longer in the book."
+            return
+        }
+        if (reason.isBlank()) {
+            error = "Enter a reason to void this transaction."
+            return
+        }
+        if (transaction.voided) {
+            error = "This transaction is already voided."
+            return
+        }
+        doc.voidTransaction(transactionGuid, reason, voidTime)
+        error = null
+        save()
+    }
+
+    /** Reverses [voidTransaction]. A split's reconciled state before voiding is not restored. */
+    fun unvoidTransaction(transactionGuid: Guid) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        val transaction = doc.transaction(transactionGuid) ?: run {
+            error = "That transaction is no longer in the book."
+            return
+        }
+        if (!transaction.voided) {
+            error = "This transaction isn't voided."
+            return
+        }
+        doc.unvoidTransaction(transactionGuid)
+        error = null
+        save()
+    }
+
+    /**
      * Atomically rewrites the whole book, the way desktop GnuCash's XML
      * backend saves: write a temporary file, then replace the original. A
      * fixed name is safe -- the repository is only ever driven from the
