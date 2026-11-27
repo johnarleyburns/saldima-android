@@ -7,6 +7,7 @@ import android.net.Uri
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.core.content.FileProvider
 import guru.parso.saldima.core.AccountType
 import guru.parso.saldima.core.BookFiles
 import guru.parso.saldima.core.BookFormat
@@ -15,6 +16,7 @@ import guru.parso.saldima.core.CustomerDraft
 import guru.parso.saldima.core.Guid
 import guru.parso.saldima.core.IdGenerator
 import guru.parso.saldima.core.Money
+import guru.parso.saldima.core.RegisterExportRow
 import guru.parso.saldima.core.SqliteBookReader
 import guru.parso.saldima.core.SqliteRows
 import guru.parso.saldima.core.Totals
@@ -26,6 +28,10 @@ import guru.parso.saldima.core.XmlCustomer
 import guru.parso.saldima.core.XmlInvoice
 import guru.parso.saldima.core.XmlInvoiceEntry
 import guru.parso.saldima.core.XmlVendor
+import guru.parso.saldima.core.registerExportFilename
+import guru.parso.saldima.core.registerExportRows
+import guru.parso.saldima.core.serializeCsv
+import guru.parso.saldima.core.serializeQif
 import java.io.File
 import java.util.UUID
 
@@ -644,6 +650,36 @@ class BookRepository(private val context: Context) {
     fun receiptImage(relativePath: String): ByteArray? {
         val file = File(receiptsDirectory, relativePath.removePrefix("receipts/"))
         return if (file.exists()) file.readBytes() else null
+    }
+
+    // MARK: - Register export (QIF/CSV)
+
+    private val exportsDirectory: File get() = File(context.cacheDir, "exports").apply { mkdirs() }
+
+    /**
+     * Writes one account's register as a QIF file (the same format
+     * `packages/importers` reads and writes on the web track) to a cache
+     * file and returns a `content://` URI the caller can share, or `null`
+     * if there's no open book or the account is unknown.
+     */
+    fun exportQifUri(accountGuid: Guid): Uri? = exportRegisterUri(accountGuid, "qif", ::serializeQif)
+
+    /** Same as [exportQifUri], but as a CSV file. */
+    fun exportCsvUri(accountGuid: Guid): Uri? = exportRegisterUri(accountGuid, "csv", ::serializeCsv)
+
+    private fun exportRegisterUri(
+        accountGuid: Guid,
+        extension: String,
+        serialize: (List<RegisterExportRow>) -> String,
+    ): Uri? {
+        val snap = snapshot ?: return null
+        val account = snap.accounts.firstOrNull { it.guid == accountGuid } ?: return null
+        val names = snap.accounts.associate { it.guid to it.name }
+        val rows = registerExportRows(snap.transactions, names, accountGuid)
+        val filename = registerExportFilename(account.name, extension)
+        val file = File(exportsDirectory, filename)
+        file.writeText(serialize(rows))
+        return FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
     }
 
     // MARK: - Reconcile

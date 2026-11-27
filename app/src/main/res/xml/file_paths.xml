@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Grants the FileProvider access only to the "exports" subdirectory of
+     the app's cache dir, where BookRepository writes QIF/CSV register
+     exports; nothing else in app storage is shared. -->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <cache-path name="exports" path="exports/" />
+</paths>

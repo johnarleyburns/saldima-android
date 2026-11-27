@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 package guru.parso.saldima.app
 
+import android.content.Intent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -34,6 +35,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import guru.parso.saldima.core.AccountType
@@ -45,8 +47,20 @@ import java.time.LocalDate
 
 private data class Row(val account: SnapshotAccount, val depth: Int)
 
+/** Shares a register export via the system share sheet. No-ops if the export couldn't be built. */
+private fun shareRegisterExport(context: android.content.Context, uri: android.net.Uri?, mimeType: String) {
+    if (uri == null) return
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = mimeType
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(intent, null))
+}
+
 @Composable
 fun AccountsScreen(repository: BookRepository) {
+    val context = LocalContext.current
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(repository::import)
     }
@@ -159,6 +173,20 @@ fun AccountsScreen(repository: BookRepository) {
                             text = { Text("Reconcile") },
                             onClick = {
                                 reconciling = row.account
+                                menuFor = null
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Export QIF") },
+                            onClick = {
+                                shareRegisterExport(context, repository.exportQifUri(row.account.guid), "text/qif")
+                                menuFor = null
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Export CSV") },
+                            onClick = {
+                                shareRegisterExport(context, repository.exportCsvUri(row.account.guid), "text/csv")
                                 menuFor = null
                             },
                         )

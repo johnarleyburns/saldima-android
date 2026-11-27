@@ -404,10 +404,11 @@ class XmlBookDocument private constructor(
             val account = guidValue(splitNode, "account") ?: return@mapNotNull null
             val value = firstChild(splitNode, "value")?.text?.let(::rational) ?: return@mapNotNull null
             val splitGuid = guidValue(splitNode, "id")
+            val memo = firstChild(splitNode, "memo")?.text ?: ""
             val reconcileState = firstChild(splitNode, "reconciled-state")?.text?.ifEmpty { null } ?: "n"
             val reconcileDate = firstChild(splitNode, "reconcile-date")?.let { firstChild(it, "date")?.text }
             val voidFormerValue = readNumericSlot(splitNode, "void-former-value")
-            SnapshotSplit(account, value, splitGuid, reconcileState, reconcileDate, voidFormerValue)
+            SnapshotSplit(account, value, splitGuid, memo, reconcileState, reconcileDate, voidFormerValue)
         }
         val docLink = firstChild(node, "slots")
             ?.let { slots -> children(slots, "slot").firstOrNull { firstChild(it, "key")?.text == "assoc_uri" } }
