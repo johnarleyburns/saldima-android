@@ -18,6 +18,7 @@ data class SnapshotSplit(
     val accountGuid: Guid,
     val value: Money,
     val guid: Guid? = null,
+    val memo: String = "",
     /** `"n"` not reconciled, `"c"` cleared, `"y"` reconciled, `"v"` voided -- GnuCash's own codes. */
     val reconcileState: String = "n",
     /** Set only once `reconcileState` is `"y"`; `YYYY-MM-DD HH:MM:SS +ZZZZ`. */
