@@ -35,6 +35,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import guru.parso.saldima.core.Guid
 import guru.parso.saldima.core.Money
+import guru.parso.saldima.core.matchesJournalSearch
 import java.time.LocalDate
 
 /** Every transaction in the open book, like Tools -> General Journal. */
@@ -43,6 +44,7 @@ fun JournalScreen(repository: BookRepository) {
     LaunchedEffect(Unit) { repository.loadExisting() }
     var composing by remember { mutableStateOf(false) }
     var voidingTransaction by remember { mutableStateOf<guru.parso.saldima.core.SnapshotTransaction?>(null) }
+    var searchText by remember { mutableStateOf("") }
     val snapshot = repository.snapshot
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text("Register", style = MaterialTheme.typography.headlineMedium)
@@ -61,9 +63,23 @@ fun JournalScreen(repository: BookRepository) {
         }
 
         val names = snapshot.accounts.associate { it.guid to it.name }
+        OutlinedTextField(
+            searchText,
+            { searchText = it },
+            label = { Text("Find transactions") },
+            placeholder = { Text("Description, memo or account") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(10.dp))
+        val filtered = snapshot.transactions.filter { matchesJournalSearch(it, searchText, names) }
+        if (filtered.isEmpty()) {
+            Text("No matching transactions.", style = MaterialTheme.typography.bodyMedium)
+            return@Column
+        }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            items(snapshot.transactions.size) { index ->
-                val transaction = snapshot.transactions[index]
+            items(filtered.size) { index ->
+                val transaction = filtered[index]
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
