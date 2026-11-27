@@ -1041,4 +1041,322 @@ class XmlBookDocumentTest {
 
         document.deleteScheduledTransaction(Guid.parse("f".repeat(32)))
     }
+
+    // MARK: - Budgets
+
+    private fun createMonthlyBudget(document: XmlBookDocument, guid: Guid): XmlBudget = document.createBudget(
+        guid = guid,
+        name = "2026 household",
+        description = "Household budget for 2026",
+        periodCount = 12,
+        recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-01", WeekendAdjust.NONE),
+    )
+
+    @Test
+    fun `creates a budget matching real GnuCash's on-disk shape, and reads it back`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val guid = Guid.parse("1".repeat(32))
+        val budget = createMonthlyBudget(document, guid)
+
+        assertEquals(
+            XmlBudget(
+                guid = guid,
+                name = "2026 household",
+                description = "Household budget for 2026",
+                periodCount = 12,
+                recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-01", WeekendAdjust.NONE),
+            ),
+            budget,
+        )
+
+        val serialized = String(document.serialize(), Charsets.UTF_8)
+        assertTrue("<gnc:budget version=\"2.0.0\">" in serialized)
+        assertTrue("<bgt:id type=\"guid\">${guid.raw}</bgt:id>" in serialized)
+        assertTrue("<bgt:name>2026 household</bgt:name>" in serialized)
+        assertTrue("<bgt:num-periods>12</bgt:num-periods>" in serialized)
+        // No separate wrapper -- the version attribute and recurrence:* children
+        // sit directly on <bgt:recurrence>, unlike sx:schedule's inner gnc:recurrence.
+        assertTrue("<bgt:recurrence version=\"1.0.0\">" in serialized)
+        assertTrue("<recurrence:period_type>month</recurrence:period_type>" in serialized)
+        assertFalse("<gnc:recurrence" in serialized)
+
+        val reparsed = XmlBookDocument.parse(document.serialize())
+        assertEquals(budget, reparsed.budget(guid))
+    }
+
+    @Test
+    fun `supports multiple budgets per book`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        createMonthlyBudget(document, Guid.parse("1".repeat(32)))
+        document.createBudget(
+            guid = Guid.parse("2".repeat(32)),
+            name = "Vacation fund",
+            description = "",
+            periodCount = 4,
+            recurrence = Recurrence(PeriodType.END_OF_MONTH, 3, "2026-01-01", WeekendAdjust.NONE),
+        )
+        assertEquals(listOf("2026 household", "Vacation fund"), document.budgets().map { it.name }.sorted())
+    }
+
+    @Test
+    fun `rejects a budget with fewer than one period`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        assertFailsWith<BookFormatException> {
+            document.createBudget(
+                guid = Guid.parse("1".repeat(32)),
+                name = "Bad",
+                description = "",
+                periodCount = 0,
+                recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-01", WeekendAdjust.NONE),
+            )
+        }
+    }
+
+    @Test
+    fun `rejects a duplicate budget guid`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val guid = Guid.parse("1".repeat(32))
+        createMonthlyBudget(document, guid)
+        assertFailsWith<BookFormatException> { createMonthlyBudget(document, guid) }
+    }
+
+    @Test
+    fun `updates name, description and periodCount independently`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val guid = Guid.parse("1".repeat(32))
+        val budget = createMonthlyBudget(document, guid)
+
+        val updated = document.updateBudget(guid, name = "Renamed")
+        assertEquals("Renamed", updated.name)
+        assertEquals(budget.description, updated.description)
+        assertEquals(budget.periodCount, updated.periodCount)
+
+        val updated2 = document.updateBudget(guid, periodCount = 6)
+        assertEquals(6, updated2.periodCount)
+        assertEquals("Renamed", updated2.name)
+
+        val updated3 = document.updateBudget(guid, description = "New description")
+        assertEquals("New description", updated3.description)
+        assertEquals("Renamed", updated3.name)
+    }
+
+    @Test
+    fun `rejects updating to fewer than one period, and updating an unknown budget`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val guid = Guid.parse("1".repeat(32))
+        createMonthlyBudget(document, guid)
+        assertFailsWith<BookFormatException> { document.updateBudget(guid, periodCount = 0) }
+        assertFailsWith<BookFormatException> { document.updateBudget(Guid.parse("f".repeat(32)), name = "x") }
+    }
+
+    @Test
+    fun `deletes a budget`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val guid = Guid.parse("1".repeat(32))
+        createMonthlyBudget(document, guid)
+        document.deleteBudget(guid)
+        assertEquals(emptyList(), document.budgets())
+        // Deleting an unknown budget is a silent no-op, matching deleteAccount/deleteTransaction.
+        document.deleteBudget(Guid.parse("f".repeat(32)))
+    }
+
+    @Test
+    fun `computes each period's start-end range from the recurrence`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val budget = createMonthlyBudget(document, Guid.parse("1".repeat(32)))
+        assertEquals(BudgetPeriodRange("2026-01-01", "2026-02-01"), document.periodRange(budget, 0))
+        assertEquals(BudgetPeriodRange("2026-02-01", "2026-03-01"), document.periodRange(budget, 1))
+        assertEquals(BudgetPeriodRange("2026-12-01", "2027-01-01"), document.periodRange(budget, 11))
+        assertFailsWith<BookFormatException> { document.periodRange(budget, -1) }
+    }
+
+    @Test
+    fun `throws computing a period's end past a 'once' recurrence's single instance`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val budget = document.createBudget(
+            guid = Guid.parse("5".repeat(32)),
+            name = "One-off",
+            description = "",
+            periodCount = 1,
+            recurrence = Recurrence(PeriodType.ONCE, 1, "2026-01-01", WeekendAdjust.NONE),
+        )
+        assertFailsWith<BookFormatException> { document.periodRange(budget, 0) }
+    }
+
+    @Test
+    fun `sets, reads back and removes a per-account-per-period amount, never writing a zero placeholder`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val guid = Guid.parse("1".repeat(32))
+        createMonthlyBudget(document, guid)
+
+        assertNull(document.budgetAmount(guid, bank, 0))
+
+        document.setBudgetAmount(guid, bank, 0, Money(150000, 100))
+        assertEquals(Money(150000, 100), document.budgetAmount(guid, bank, 0))
+
+        val serialized = String(document.serialize(), Charsets.UTF_8)
+        assertTrue("<slot:key>${bank.raw}</slot:key>" in serialized)
+        assertTrue("<slot:value type=\"frame\">" in serialized)
+        assertTrue(
+            "<slot:key>0</slot:key><slot:value type=\"numeric\">150000/100</slot:value>" in serialized,
+        )
+
+        val reparsed = XmlBookDocument.parse(document.serialize())
+        assertEquals(Money(150000, 100), reparsed.budgetAmount(guid, bank, 0))
+
+        document.setBudgetAmount(guid, bank, 0, null)
+        assertNull(document.budgetAmount(guid, bank, 0))
+        // Removing the only set period removes the now-empty account frame too.
+        assertFalse("<slot:key>${bank.raw}</slot:key>" in String(document.serialize(), Charsets.UTF_8))
+    }
+
+    @Test
+    fun `tracks several accounts and periods independently on the same budget`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        val guid = Guid.parse("1".repeat(32))
+        createMonthlyBudget(document, guid)
+
+        document.setBudgetAmount(guid, bank, 0, Money(100000, 100))
+        document.setBudgetAmount(guid, bank, 1, Money(110000, 100))
+        document.setBudgetAmount(guid, salary, 0, Money(-250000, 100))
+
+        assertEquals(Money(100000, 100), document.budgetAmount(guid, bank, 0))
+        assertEquals(Money(110000, 100), document.budgetAmount(guid, bank, 1))
+        assertNull(document.budgetAmount(guid, bank, 2))
+        assertEquals(Money(-250000, 100), document.budgetAmount(guid, salary, 0))
+
+        // Overwriting an already-set period updates it in place.
+        document.setBudgetAmount(guid, bank, 1, Money(120000, 100))
+        assertEquals(Money(120000, 100), document.budgetAmount(guid, bank, 1))
+
+        // Removing a period that was never set, on an account that still has
+        // a frame (because another period on it is set), is also a no-op.
+        document.setBudgetAmount(guid, bank, 5, null)
+        assertNull(document.budgetAmount(guid, bank, 5))
+        assertEquals(Money(120000, 100), document.budgetAmount(guid, bank, 1))
+
+        // Removing one period leaves the account's other set period untouched.
+        document.setBudgetAmount(guid, bank, 0, null)
+        assertNull(document.budgetAmount(guid, bank, 0))
+        assertEquals(Money(120000, 100), document.budgetAmount(guid, bank, 1))
+    }
+
+    @Test
+    fun `removing an amount from an unknown budget or an account with no frame is a silent no-op`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val guid = Guid.parse("1".repeat(32))
+        createMonthlyBudget(document, guid)
+        document.setBudgetAmount(guid, bank, 0, null)
+        assertNull(document.budgetAmount(Guid.parse("f".repeat(32)), bank, 0))
+    }
+
+    @Test
+    fun `rejects setting an amount on an unknown budget or a negative period index`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val guid = Guid.parse("1".repeat(32))
+        createMonthlyBudget(document, guid)
+        assertFailsWith<BookFormatException> {
+            document.setBudgetAmount(Guid.parse("f".repeat(32)), bank, 0, Money(1, 1))
+        }
+        assertFailsWith<BookFormatException> { document.setBudgetAmount(guid, bank, -1, Money(1, 1)) }
+    }
+
+    @Test
+    fun `computes actual as the sum of an account's splits inside the period, live, never stored`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        val guid = Guid.parse("1".repeat(32))
+        createMonthlyBudget(document, guid)
+
+        document.postTransaction(
+            guid = Guid.parse("9".repeat(32)),
+            date = "2026-01-15",
+            description = "January paycheck",
+            splits = listOf(
+                Triple(bank, Money(300000, 100), Guid.parse("a0".repeat(16))),
+                Triple(salary, Money(-300000, 100), Guid.parse("a1".repeat(16))),
+            ),
+        )
+        // Outside period 0's range -- lands in period 1 instead, must not be
+        // counted against period 0.
+        document.postTransaction(
+            guid = Guid.parse("a".repeat(32)),
+            date = "2026-02-15",
+            description = "February paycheck",
+            splits = listOf(
+                Triple(bank, Money(300000, 100), Guid.parse("b0".repeat(16))),
+                Triple(salary, Money(-300000, 100), Guid.parse("b1".repeat(16))),
+            ),
+        )
+
+        // Money.add reduces to lowest terms, so 300000/100 comes back as 3000/1.
+        assertEquals(Money(3000, 1), document.budgetActual(guid, bank, 0))
+        assertEquals(Money(-3000, 1), document.budgetActual(guid, salary, 0))
+        assertEquals(Money(3000, 1), document.budgetActual(guid, bank, 1))
+        // Never written to disk.
+        assertFalse("budget-actual" in String(document.serialize(), Charsets.UTF_8))
+    }
+
+    @Test
+    fun `throws computing actual for an unknown budget`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        assertFailsWith<BookFormatException> { document.budgetActual(Guid.parse("f".repeat(32)), bank, 0) }
+    }
+
+    @Test
+    fun `round-trips a hand-written budget fixture with pre-existing amounts untouched`() {
+        val bank = Guid.parse("6".repeat(32))
+        val guid = Guid.parse("7".repeat(32))
+        val xml = """<?xml version="1.0" encoding="utf-8" ?>
+<gnc-v2 xmlns:gnc="http://www.gnucash.org/XML/gnc" xmlns:bgt="http://www.gnucash.org/XML/bgt" xmlns:book="http://www.gnucash.org/XML/book" xmlns:recurrence="http://www.gnucash.org/XML/recurrence" xmlns:slot="http://www.gnucash.org/XML/slot">
+<gnc:book version="2.0.0">
+<book:id type="guid">${"b".repeat(32)}</book:id>
+<gnc:budget version="2.0.0">
+  <bgt:id type="guid">${guid.raw}</bgt:id>
+  <bgt:name>Hand-written</bgt:name>
+  <bgt:description>A fixture written by hand, not this engine</bgt:description>
+  <bgt:num-periods>3</bgt:num-periods>
+  <bgt:recurrence version="1.0.0">
+    <recurrence:mult>1</recurrence:mult>
+    <recurrence:period_type>month</recurrence:period_type>
+    <recurrence:start><gdate>2026-06-01</gdate></recurrence:start>
+  </bgt:recurrence>
+  <bgt:slots>
+    <slot>
+      <slot:key>${bank.raw}</slot:key>
+      <slot:value type="frame">
+        <slot><slot:key>0</slot:key><slot:value type="numeric">50000/100</slot:value></slot>
+        <slot><slot:key>2</slot:key><slot:value type="numeric">60000/100</slot:value></slot>
+      </slot:value>
+    </slot>
+  </bgt:slots>
+</gnc:budget>
+</gnc:book>
+</gnc-v2>"""
+        val document = XmlBookDocument.parse(xml.toByteArray(Charsets.UTF_8))
+        assertEquals(
+            XmlBudget(
+                guid = guid,
+                name = "Hand-written",
+                description = "A fixture written by hand, not this engine",
+                periodCount = 3,
+                recurrence = Recurrence(PeriodType.MONTH, 1, "2026-06-01", WeekendAdjust.NONE),
+            ),
+            document.budget(guid),
+        )
+        assertEquals(Money(50000, 100), document.budgetAmount(guid, bank, 0))
+        assertNull(document.budgetAmount(guid, bank, 1))
+        assertEquals(Money(60000, 100), document.budgetAmount(guid, bank, 2))
+
+        val reparsed = XmlBookDocument.parse(document.serialize())
+        assertEquals(document.budget(guid), reparsed.budget(guid))
+        assertEquals(Money(50000, 100), reparsed.budgetAmount(guid, bank, 0))
+    }
 }
