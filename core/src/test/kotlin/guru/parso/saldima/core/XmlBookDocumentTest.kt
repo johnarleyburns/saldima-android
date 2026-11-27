@@ -343,6 +343,101 @@ class XmlBookDocumentTest {
     }
 
     @Test
+    fun `creates a vendor, a bill with lines, and posts it as a real transaction`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        val vendorGuid = Guid.parse("1".repeat(32))
+
+        val vendor = document.createVendor(
+            vendorGuid,
+            VendorDraft(name = "Acme Supplies", vendorNumber = "V-0001", email = "ap@acme.test"),
+            "USD",
+        )
+        assertEquals("Acme Supplies", vendor.name)
+        assertEquals(1, document.vendors().size)
+        assertEquals("V-0001", assertNotNull(document.vendor(vendorGuid)).vendorNumber)
+
+        document.updateVendor(vendorGuid, name = "Acme Supplies Inc")
+        assertEquals("Acme Supplies Inc", assertNotNull(document.vendor(vendorGuid)).name)
+
+        val billGuid = Guid.parse("2".repeat(32))
+        val bill = document.createBill(
+            billGuid,
+            vendorGuid,
+            billNumber = "BILL-1001",
+            dateOpened = "2026-03-01",
+            currencyCode = "USD",
+        )
+        assertNull(bill.datePosted)
+        assertEquals(1, document.bills().size)
+        // A bill shares GncInvoice with customer invoices but must never
+        // show up as one, and vice versa.
+        assertEquals(0, document.invoices().size)
+
+        val lineGuid = Guid.parse("3".repeat(32))
+        val entry = document.addBillEntry(
+            lineGuid,
+            billGuid,
+            date = "2026-03-01",
+            description = "Office supplies",
+            quantity = Money(1, 1),
+            unitPrice = Money(8000, 100),
+            expenseAccountGuid = salary,
+        )
+        assertEquals(Money(8000, 100), entry.unitPrice)
+        assertEquals(1, document.billEntries(billGuid).size)
+
+        val txGuid = Guid.parse("4".repeat(32))
+        document.postTransaction(
+            guid = txGuid,
+            date = "2026-03-01",
+            description = "Bill BILL-1001",
+            splits = listOf(
+                Triple(salary, Money(8000, 100), Guid.parse("5".repeat(32))),
+                Triple(bank, Money(-8000, 100), Guid.parse("6".repeat(32))),
+            ),
+        )
+        document.markBillPosted(billGuid, "2026-03-01", txGuid, bank)
+
+        val posted = assertNotNull(document.bill(billGuid))
+        assertEquals("2026-03-01", posted.datePosted)
+        assertEquals(txGuid, posted.postedTransactionGuid)
+        assertEquals(bank, posted.payableAccountGuid)
+
+        val reparsed = XmlBookDocument.parse(document.serialize())
+        assertEquals(1, reparsed.vendors().size)
+        assertEquals(1, reparsed.bills().size)
+        assertEquals(1, reparsed.billEntries(billGuid).size)
+        assertEquals("2026-03-01", assertNotNull(reparsed.bill(billGuid)).datePosted)
+        assertEquals(0, reparsed.invoices().size)
+
+        document.deleteVendor(vendorGuid)
+        assertNull(document.vendor(vendorGuid))
+    }
+
+    @Test
+    fun `refuses to delete a vendor that still has bills, and no-ops on unknown ids`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val vendorGuid = Guid.parse("1".repeat(32))
+        document.createVendor(vendorGuid, VendorDraft(name = "Acme"), "USD")
+        val billGuid = Guid.parse("2".repeat(32))
+        document.createBill(billGuid, vendorGuid, "BILL-1", "2026-03-01", currencyCode = "USD")
+        assertTrue(document.vendorInUse(vendorGuid))
+
+        document.deleteBill(billGuid)
+        assertNull(document.bill(billGuid))
+        assertFalse(document.vendorInUse(vendorGuid))
+
+        val unknown = Guid.parse("f".repeat(32))
+        document.deleteVendor(unknown)
+        document.deleteBill(unknown)
+        document.deleteBillEntry(unknown)
+        assertFailsWith<BookFormatException> { document.updateVendor(unknown, name = "x") }
+        assertFailsWith<BookFormatException> { document.markBillPosted(unknown, "2026-01-01", unknown, unknown) }
+    }
+
+    @Test
     fun `imports the real ~3,300-transaction synthetic ledger and reopens it`() {
         val snapshot = XmlBookReader.read(File("../fixtures/books/gronewald-gl-2023-01.gnucash"))
         val document = XmlBookDocument.build(snapshot, Guid.parse("f".repeat(32)), DocumentSequenceIds(start = 9000))

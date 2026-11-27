@@ -18,10 +18,14 @@ import guru.parso.saldima.core.Money
 import guru.parso.saldima.core.SqliteBookReader
 import guru.parso.saldima.core.SqliteRows
 import guru.parso.saldima.core.Totals
+import guru.parso.saldima.core.VendorDraft
+import guru.parso.saldima.core.XmlBill
+import guru.parso.saldima.core.XmlBillEntry
 import guru.parso.saldima.core.XmlBookDocument
 import guru.parso.saldima.core.XmlCustomer
 import guru.parso.saldima.core.XmlInvoice
 import guru.parso.saldima.core.XmlInvoiceEntry
+import guru.parso.saldima.core.XmlVendor
 import java.io.File
 import java.util.UUID
 
@@ -50,6 +54,10 @@ class BookRepository(private val context: Context) {
     var customers by mutableStateOf<List<XmlCustomer>>(emptyList())
         private set
     var invoices by mutableStateOf<List<XmlInvoice>>(emptyList())
+        private set
+    var vendors by mutableStateOf<List<XmlVendor>>(emptyList())
+        private set
+    var bills by mutableStateOf<List<XmlBill>>(emptyList())
         private set
 
     private val directory: File get() = File(context.filesDir, "books").apply { mkdirs() }
@@ -257,6 +265,8 @@ class BookRepository(private val context: Context) {
         totals = Totals.rolledUp(built)
         customers = doc.customers().sortedBy { it.name.lowercase() }
         invoices = doc.invoices().sortedByDescending { it.dateOpened }
+        vendors = doc.vendors().sortedBy { it.name.lowercase() }
+        bills = doc.bills().sortedByDescending { it.dateOpened }
     }
 
     // MARK: - Clients (GncCustomer)
@@ -422,6 +432,174 @@ class BookRepository(private val context: Context) {
         val txGuid = ids.next()
         doc.postTransaction(txGuid, postedDate, "Invoice ${invoice.invoiceNumber}", splits)
         doc.markInvoicePosted(invoiceGuid, postedDate, txGuid, receivableAccount)
+        error = null
+        save()
+    }
+
+    // MARK: - Vendors (GncVendor)
+
+    fun billEntries(billGuid: Guid): List<XmlBillEntry> = document?.billEntries(billGuid).orEmpty()
+
+    fun createVendor(draft: VendorDraft) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        if (draft.name.isBlank()) {
+            error = "Enter a name."
+            return
+        }
+        doc.createVendor(ids.next(), draft, snapshot?.currencyCode ?: "USD")
+        error = null
+        save()
+    }
+
+    fun updateVendor(guid: Guid, draft: VendorDraft) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        if (draft.name.isBlank()) {
+            error = "Enter a name."
+            return
+        }
+        doc.updateVendor(
+            guid,
+            name = draft.name,
+            vendorNumber = draft.vendorNumber,
+            addressLine1 = draft.addressLine1,
+            phone = draft.phone,
+            email = draft.email,
+            notes = draft.notes,
+        )
+        error = null
+        save()
+    }
+
+    fun deleteVendor(guid: Guid) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        if (doc.vendorInUse(guid)) {
+            error = "This vendor has bills and cannot be deleted."
+            return
+        }
+        doc.deleteVendor(guid)
+        error = null
+        save()
+    }
+
+    // MARK: - Bills and lines (GncInvoice / GncEntry, vendor-owned)
+
+    fun createBillDraft(vendorGuid: Guid, billNumber: String, dateOpened: String): Guid? {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return null
+        }
+        if (billNumber.isBlank()) {
+            error = "Enter a bill number."
+            return null
+        }
+        val guid = ids.next()
+        doc.createBill(
+            guid,
+            vendorGuid,
+            billNumber = billNumber,
+            dateOpened = dateOpened,
+            currencyCode = snapshot?.currencyCode ?: "USD",
+        )
+        error = null
+        save()
+        return guid
+    }
+
+    fun addBillLine(
+        billGuid: Guid,
+        date: String,
+        description: String,
+        quantity: Money,
+        unitPrice: Money,
+        expenseAccount: Guid,
+    ) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        val bill = doc.bill(billGuid)
+        if (bill == null || bill.isPosted) {
+            error = "A posted bill cannot be edited."
+            return
+        }
+        if (description.isBlank() || quantity == Money.ZERO || unitPrice == Money.ZERO) {
+            error = "Fill in a description and a non-zero quantity and unit price."
+            return
+        }
+        doc.addBillEntry(ids.next(), billGuid, date, description, quantity, unitPrice, expenseAccount)
+        error = null
+        save()
+    }
+
+    fun deleteBillLine(billGuid: Guid, lineGuid: Guid) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        val bill = doc.bill(billGuid)
+        if (bill == null || bill.isPosted) {
+            error = "A posted bill cannot be edited."
+            return
+        }
+        doc.deleteBillEntry(lineGuid)
+        error = null
+        save()
+    }
+
+    fun deleteBillDraft(billGuid: Guid) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        val bill = doc.bill(billGuid)
+        if (bill == null || bill.isPosted) {
+            error = "A posted bill cannot be deleted."
+            return
+        }
+        doc.deleteBill(billGuid)
+        error = null
+        save()
+    }
+
+    /**
+     * Posts a draft bill: debits each line's expense account for its
+     * amount and credits the chosen payable account for the total -- the
+     * same effect as desktop GnuCash's own "Post Bill". One-way: a posted
+     * bill is permanent ledger history and can no longer be edited or
+     * deleted.
+     */
+    fun postBill(billGuid: Guid, payableAccount: Guid, postedDate: String) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        val bill = doc.bill(billGuid)
+        if (bill == null || bill.isPosted) {
+            error = "This bill is already posted."
+            return
+        }
+        val entries = doc.billEntries(billGuid)
+        if (entries.isEmpty()) {
+            error = "Add at least one line before posting."
+            return
+        }
+        var total = Money.ZERO
+        val splits = entries.map { entry ->
+            total = Money.add(total, entry.amount)
+            Triple(entry.expenseAccountGuid, entry.amount, ids.next())
+        } + Triple(payableAccount, total.negated(), ids.next())
+        val txGuid = ids.next()
+        doc.postTransaction(txGuid, postedDate, "Bill ${bill.billNumber}", splits)
+        doc.markBillPosted(billGuid, postedDate, txGuid, payableAccount)
         error = null
         save()
     }
