@@ -32,6 +32,7 @@ class XmlBookDocument private constructor(
     private val invoiceIndex = mutableMapOf<Guid, XmlNode>()
     private val vendorIndex = mutableMapOf<Guid, XmlNode>()
     private val scheduledTransactionIndex = mutableMapOf<Guid, XmlNode>()
+    private val budgetIndex = mutableMapOf<Guid, XmlNode>()
 
     init {
         reindex()
@@ -44,6 +45,7 @@ class XmlBookDocument private constructor(
         invoiceIndex.clear()
         vendorIndex.clear()
         scheduledTransactionIndex.clear()
+        budgetIndex.clear()
         for (node in children(book, "account")) {
             guidValue(node, "id")?.let { accountIndex[it] = node }
         }
@@ -64,6 +66,9 @@ class XmlBookDocument private constructor(
         }
         for (node in children(book, "schedxaction")) {
             guidValue(node, "id")?.let { scheduledTransactionIndex[it] = node }
+        }
+        for (node in children(book, "budget")) {
+            guidValue(node, "id")?.let { budgetIndex[it] = node }
         }
     }
 
@@ -1230,6 +1235,214 @@ class XmlBookDocument private constructor(
             if (key != null && entryValue != null) entries[key] = entryValue
         }
         return entries
+    }
+
+    // MARK: - Budgets (GncBudget)
+
+    fun budgets(): List<XmlBudget> = budgetIndex.values.mapNotNull(::budgetRow)
+
+    fun budget(guid: Guid): XmlBudget? = budgetIndex[guid]?.let(::budgetRow)
+
+    private fun budgetRow(node: XmlNode): XmlBudget? {
+        val guid = guidValue(node, "id") ?: return null
+        val name = firstChild(node, "name")?.text ?: ""
+        val description = firstChild(node, "description")?.text ?: ""
+        val periodCount = firstChild(node, "num-periods")?.text?.toIntOrNull() ?: 0
+        val recurrenceNode = firstChild(node, "recurrence")
+        val multiplier = recurrenceNode?.let { firstChild(it, "mult")?.text?.toIntOrNull() } ?: 1
+        val periodTypeXml = recurrenceNode?.let { firstChild(it, "period_type")?.text } ?: "once"
+        val periodType = PERIOD_TYPE_FROM_XML[periodTypeXml] ?: PeriodType.ONCE
+        val start = recurrenceNode?.let { readGdate(it, "start") } ?: ""
+        val weekendAdjust = when (recurrenceNode?.let { firstChild(it, "weekend_adj")?.text }) {
+            "back" -> WeekendAdjust.BACK
+            "forward" -> WeekendAdjust.FORWARD
+            else -> WeekendAdjust.NONE
+        }
+        return XmlBudget(guid, name, description, periodCount, Recurrence(periodType, multiplier, start, weekendAdjust))
+    }
+
+    /**
+     * Creates a budget matching real GnuCash's on-disk shape exactly:
+     * `<gnc:budget>` is a direct child of `<gnc:book>`, sibling of
+     * `gnc:account`/`gnc:transaction`/`gnc:schedxaction`. Unlike
+     * `sx:schedule`, `bgt:recurrence` is not a wrapper -- its own
+     * `recurrence:*` children sit directly on it. The recurrence is
+     * immutable after creation, same convention as scheduled transactions;
+     * [updateBudget] only ever touches name/description/periodCount.
+     */
+    fun createBudget(
+        guid: Guid,
+        name: String,
+        description: String,
+        periodCount: Int,
+        recurrence: Recurrence,
+    ): XmlBudget {
+        if (budgetIndex.containsKey(guid)) {
+            throw BookFormatException("duplicate budget ${guid.raw}")
+        }
+        if (periodCount < 1) {
+            throw BookFormatException("a budget needs at least one period")
+        }
+        val budgetNode = XmlNode("gnc:budget")
+        budgetNode.attributes["version"] = "2.0.0"
+        budgetNode.addChild(leaf("bgt:id", guid.raw, "type" to "guid"))
+        budgetNode.addChild(leaf("bgt:name", name))
+        budgetNode.addChild(leaf("bgt:description", description))
+        budgetNode.addChild(leaf("bgt:num-periods", periodCount.toString()))
+        val recurrenceNode = XmlNode("bgt:recurrence")
+        recurrenceNode.attributes["version"] = "1.0.0"
+        recurrenceNode.addChild(leaf("recurrence:mult", recurrence.multiplier.toString()))
+        recurrenceNode.addChild(leaf("recurrence:period_type", PERIOD_TYPE_TO_XML.getValue(recurrence.periodType)))
+        recurrenceNode.addChild(gdateNode("recurrence:start", recurrence.start))
+        if (recurrence.weekendAdjust != WeekendAdjust.NONE) {
+            recurrenceNode.addChild(leaf("recurrence:weekend_adj", recurrence.weekendAdjust.name.lowercase()))
+        }
+        budgetNode.addChild(recurrenceNode)
+        book.addChild(budgetNode)
+        budgetIndex[guid] = budgetNode
+        return budgetRow(budgetNode) ?: throw BookFormatException("failed to build budget")
+    }
+
+    fun updateBudget(
+        guid: Guid,
+        name: String? = null,
+        description: String? = null,
+        periodCount: Int? = null,
+    ): XmlBudget {
+        val node = budgetIndex[guid] ?: throw BookFormatException("unknown budget ${guid.raw}")
+        name?.let { setChildText(node, "name", "bgt:name", it) }
+        description?.let { setChildText(node, "description", "bgt:description", it) }
+        periodCount?.let {
+            if (it < 1) throw BookFormatException("a budget needs at least one period")
+            setChildText(node, "num-periods", "bgt:num-periods", it.toString())
+        }
+        return budgetRow(node) ?: throw BookFormatException("failed to read budget ${guid.raw}")
+    }
+
+    /** Silent no-op on an unknown guid, matching deleteAccount/deleteTransaction. */
+    fun deleteBudget(guid: Guid) {
+        val node = budgetIndex[guid] ?: return
+        node.detach()
+        budgetIndex.remove(guid)
+    }
+
+    /**
+     * Period *N*'s `[start, end)` range: `instance(N)` to `instance(N+1)`,
+     * where `instance(0)` is the recurrence's own start and `instance(k)`
+     * is `nextInstance` applied `k` times -- matching desktop GnuCash's
+     * `recurrenceGetPeriodTime` (confirmed against the web track's own
+     * port, `periodRange` in `packages/gnucash/src/xml-document.ts`).
+     */
+    fun periodRange(budget: XmlBudget, periodIndex: Int): BudgetPeriodRange {
+        if (periodIndex < 0) throw BookFormatException("periodIndex must be 0 or greater")
+        return BudgetPeriodRange(
+            start = nthRecurrenceInstance(budget.recurrence, periodIndex),
+            end = nthRecurrenceInstance(budget.recurrence, periodIndex + 1),
+        )
+    }
+
+    private fun nthRecurrenceInstance(recurrence: Recurrence, index: Int): String {
+        var date = recurrence.start
+        repeat(index) {
+            date = nextInstance(recurrence, date) ?: throw BookFormatException("recurrence has no further instances")
+        }
+        return date
+    }
+
+    private fun findBudgetAccountFrame(budgetNode: XmlNode, accountGuid: Guid): XmlNode? {
+        val slots = firstChild(budgetNode, "slots") ?: return null
+        val accountSlot = findSlot(slots, accountGuid.raw) ?: return null
+        return firstChild(accountSlot, "value")
+    }
+
+    private fun findOrCreateBudgetSlots(budgetNode: XmlNode): XmlNode {
+        firstChild(budgetNode, "slots")?.let { return it }
+        val created = XmlNode("bgt:slots")
+        budgetNode.addChild(created)
+        return created
+    }
+
+    /**
+     * The budget's own per-account KVP frame (`bgt:slots` -> one `slot`
+     * keyed by `accountGuid`, `type="frame"`, holding one nested `slot`
+     * per set period keyed by its number) -- the exact shape
+     * `make_period_data_path` writes in real GnuCash's `gnc-budget.cpp`.
+     */
+    private fun findOrCreateBudgetAccountFrame(budgetNode: XmlNode, accountGuid: Guid): XmlNode {
+        val slots = findOrCreateBudgetSlots(budgetNode)
+        val accountSlot = findSlot(slots, accountGuid.raw) ?: run {
+            val created = XmlNode("slot")
+            created.addChild(leaf("slot:key", accountGuid.raw))
+            created.addChild(frameSlotValue(emptyList()))
+            slots.addChild(created)
+            created
+        }
+        return firstChild(accountSlot, "value") ?: throw BookFormatException("corrupt budget account frame")
+    }
+
+    /** Removes the whole per-account frame once its last period is cleared. */
+    private fun removeBudgetAccountFrameIfEmpty(budgetNode: XmlNode, accountGuid: Guid) {
+        val slots = firstChild(budgetNode, "slots") ?: return
+        val accountSlot = findSlot(slots, accountGuid.raw) ?: return
+        val frame = firstChild(accountSlot, "value") ?: return
+        if (frame.children.isEmpty()) accountSlot.detach()
+    }
+
+    /**
+     * Sets (or, with `amount = null`, removes) one account's budgeted
+     * amount for one period. Matching real GnuCash: an unset period is
+     * simply absent from the KVP tree, never a zero placeholder.
+     */
+    fun setBudgetAmount(budgetGuid: Guid, accountGuid: Guid, periodIndex: Int, amount: Money?) {
+        val budgetNode = budgetIndex[budgetGuid] ?: throw BookFormatException("unknown budget ${budgetGuid.raw}")
+        if (periodIndex < 0) throw BookFormatException("periodIndex must be 0 or greater")
+        val periodKey = periodIndex.toString()
+
+        if (amount == null) {
+            val frame = findBudgetAccountFrame(budgetNode, accountGuid) ?: return
+            children(frame, "slot").firstOrNull { firstChild(it, "key")?.text == periodKey }?.detach()
+            removeBudgetAccountFrameIfEmpty(budgetNode, accountGuid)
+            return
+        }
+
+        val frame = findOrCreateBudgetAccountFrame(budgetNode, accountGuid)
+        val existing = children(frame, "slot").firstOrNull { firstChild(it, "key")?.text == periodKey }
+        if (existing != null) {
+            firstChild(existing, "value")?.let { it.text = "${amount.num}/${amount.denom}" }
+        } else {
+            val slot = XmlNode("slot")
+            slot.addChild(leaf("slot:key", periodKey))
+            slot.addChild(leaf("slot:value", "${amount.num}/${amount.denom}", "type" to "numeric"))
+            frame.addChild(slot)
+        }
+    }
+
+    /** `null` if this account's period has never been set -- never a zero placeholder. */
+    fun budgetAmount(budgetGuid: Guid, accountGuid: Guid, periodIndex: Int): Money? {
+        val budgetNode = budgetIndex[budgetGuid] ?: return null
+        val frame = findBudgetAccountFrame(budgetNode, accountGuid) ?: return null
+        val periodKey = periodIndex.toString()
+        val slot = children(frame, "slot").firstOrNull { firstChild(it, "key")?.text == periodKey }
+        val valueNode = slot?.let { firstChild(it, "value") } ?: return null
+        return rational(valueNode.text)
+    }
+
+    /**
+     * Sum of this account's split values whose transaction date falls in
+     * the period's `[start, end)` range. Desktop GnuCash computes "actual"
+     * the same way every time, live -- it's never stored.
+     */
+    fun budgetActual(budgetGuid: Guid, accountGuid: Guid, periodIndex: Int): Money {
+        val budget = budget(budgetGuid) ?: throw BookFormatException("unknown budget ${budgetGuid.raw}")
+        val (start, end) = periodRange(budget, periodIndex)
+        var total = Money.ZERO
+        for (transaction in transactions()) {
+            if (transaction.date < start || transaction.date >= end) continue
+            for (split in transaction.splits) {
+                if (split.accountGuid == accountGuid) total = Money.add(total, split.value)
+            }
+        }
+        return total
     }
 
     // MARK: - Customers (GncCustomer)

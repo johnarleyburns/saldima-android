@@ -14,6 +14,7 @@ import guru.parso.saldima.core.BookFiles
 import guru.parso.saldima.core.BookFormat
 import guru.parso.saldima.core.BookFormatException
 import guru.parso.saldima.core.BookSnapshot
+import guru.parso.saldima.core.BudgetPeriodRange
 import guru.parso.saldima.core.CustomerDraft
 import guru.parso.saldima.core.DueInstanceAction
 import guru.parso.saldima.core.DueScheduledInstance
@@ -30,6 +31,7 @@ import guru.parso.saldima.core.VendorDraft
 import guru.parso.saldima.core.XmlBill
 import guru.parso.saldima.core.XmlBillEntry
 import guru.parso.saldima.core.XmlBookDocument
+import guru.parso.saldima.core.XmlBudget
 import guru.parso.saldima.core.XmlCustomer
 import guru.parso.saldima.core.XmlInvoice
 import guru.parso.saldima.core.XmlInvoiceEntry
@@ -75,6 +77,8 @@ class BookRepository(private val context: Context) {
     var scheduledTransactions by mutableStateOf<List<XmlScheduledTransaction>>(emptyList())
         private set
     var dueScheduledReview by mutableStateOf<List<DueScheduledInstance>>(emptyList())
+        private set
+    var budgets by mutableStateOf<List<XmlBudget>>(emptyList())
         private set
     var autoPostedCount by mutableIntStateOf(0)
         private set
@@ -287,6 +291,7 @@ class BookRepository(private val context: Context) {
         vendors = doc.vendors().sortedBy { it.name.lowercase() }
         bills = doc.bills().sortedByDescending { it.dateOpened }
         scheduledTransactions = doc.scheduledTransactions().sortedBy { it.name.lowercase() }
+        budgets = doc.budgets().sortedBy { it.name.lowercase() }
     }
 
     // MARK: - Clients (GncCustomer)
@@ -928,6 +933,84 @@ class BookRepository(private val context: Context) {
         }
         doc.skipScheduledInstance(guid, date)
         dueScheduledReview = dueScheduledReview.filterNot { it.scheduledTransactionGuid == guid && it.date == date }
+        error = null
+        save()
+    }
+
+    // MARK: - Budgets
+
+    /** Recurrence is immutable after creation -- same convention as scheduled transactions. */
+    fun createBudget(name: String, description: String, periodCount: Int, recurrence: Recurrence) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        if (name.isBlank()) {
+            error = "Enter a name."
+            return
+        }
+        try {
+            doc.createBudget(ids.next(), name, description, periodCount, recurrence)
+        } catch (failure: BookFormatException) {
+            error = failure.message ?: "Could not create that budget."
+            return
+        }
+        error = null
+        save()
+    }
+
+    /** Only name/description/periodCount are editable here -- the recurrence can't be changed after creation. */
+    fun updateBudget(guid: Guid, name: String, description: String, periodCount: Int) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        if (name.isBlank()) {
+            error = "Enter a name."
+            return
+        }
+        try {
+            doc.updateBudget(guid, name = name, description = description, periodCount = periodCount)
+        } catch (failure: BookFormatException) {
+            error = failure.message ?: "Could not update that budget."
+            return
+        }
+        error = null
+        save()
+    }
+
+    fun deleteBudget(guid: Guid) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        doc.deleteBudget(guid)
+        error = null
+        save()
+    }
+
+    fun periodRange(budget: XmlBudget, periodIndex: Int): BudgetPeriodRange? = document?.periodRange(budget, periodIndex)
+
+    fun budgetAmount(budgetGuid: Guid, accountGuid: Guid, periodIndex: Int): Money? =
+        document?.budgetAmount(budgetGuid, accountGuid, periodIndex)
+
+    fun budgetActual(budgetGuid: Guid, accountGuid: Guid, periodIndex: Int): Money =
+        document?.budgetActual(budgetGuid, accountGuid, periodIndex) ?: Money.ZERO
+
+    /**
+     * One whole-grid save -- every edited cell is written in one call, not
+     * per-cell, matching the web UI's own documented choice. A `null`
+     * amount clears that account/period's budgeted amount.
+     */
+    fun saveBudgetAmounts(budgetGuid: Guid, amounts: Map<Pair<Guid, Int>, Money?>) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        for ((key, amount) in amounts) {
+            val (accountGuid, periodIndex) = key
+            doc.setBudgetAmount(budgetGuid, accountGuid, periodIndex, amount)
+        }
         error = null
         save()
     }
