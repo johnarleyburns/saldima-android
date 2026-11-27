@@ -33,6 +33,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import guru.parso.saldima.core.DueInstanceAction
 import guru.parso.saldima.core.Guid
 import guru.parso.saldima.core.Money
 import guru.parso.saldima.core.matchesJournalSearch
@@ -41,7 +42,12 @@ import java.time.LocalDate
 /** Every transaction in the open book, like Tools -> General Journal. */
 @Composable
 fun JournalScreen(repository: BookRepository) {
-    LaunchedEffect(Unit) { repository.loadExisting() }
+    LaunchedEffect(Unit) {
+        repository.loadExisting()
+        // "Check on open": scheduled transactions due are computed every
+        // time the journal loads -- no background process, no schedule.
+        repository.checkDueScheduledTransactions(LocalDate.now().toString())
+    }
     var composing by remember { mutableStateOf(false) }
     var voidingTransaction by remember { mutableStateOf<guru.parso.saldima.core.SnapshotTransaction?>(null) }
     var searchText by remember { mutableStateOf("") }
@@ -55,6 +61,7 @@ fun JournalScreen(repository: BookRepository) {
             Text(repository.error ?: "Open a book from Accounts first.", style = MaterialTheme.typography.bodyMedium)
             return@Column
         }
+        ScheduledReviewBanner(repository)
         Button(onClick = { composing = true }) { Text("New transaction") }
         Spacer(Modifier.height(10.dp))
         if (snapshot.transactions.isEmpty()) {
@@ -141,6 +148,49 @@ fun JournalScreen(repository: BookRepository) {
             onDismiss = { voidingTransaction = null },
         )
     }
+}
+
+/**
+ * Scheduled transactions due, computed on every journal load: auto-posted
+ * ones (notify or not) are reported as already done; `NEEDS_APPROVAL` ones
+ * get Approve/Skip actions; `REMINDER` ones are shown as upcoming only.
+ * Mirrors the web track's review banner on the same page.
+ */
+@Composable
+private fun ScheduledReviewBanner(repository: BookRepository) {
+    val review = repository.dueScheduledReview
+    val autoPosted = repository.autoPostedCount
+    if (review.isEmpty() && autoPosted == 0) return
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp)) {
+            val title = if (autoPosted > 0) {
+                "Scheduled transactions due ($autoPosted posted automatically)"
+            } else {
+                "Scheduled transactions due"
+            }
+            Text(title, fontWeight = FontWeight.SemiBold)
+            for (instance in review) {
+                Spacer(Modifier.height(4.dp))
+                val suffix = when (instance.action) {
+                    DueInstanceAction.REMINDER -> " (upcoming)"
+                    DueInstanceAction.AUTO_POST_NOTIFY -> " (posted automatically)"
+                    else -> ""
+                }
+                Text("${instance.name} — ${instance.date}$suffix", style = MaterialTheme.typography.bodyMedium)
+                if (instance.action == DueInstanceAction.NEEDS_APPROVAL) {
+                    Row {
+                        TextButton(onClick = {
+                            repository.approveScheduledInstance(instance.scheduledTransactionGuid, instance.date)
+                        }) { Text("Approve") }
+                        TextButton(onClick = {
+                            repository.skipScheduledInstance(instance.scheduledTransactionGuid, instance.date)
+                        }) { Text("Skip") }
+                    }
+                }
+            }
+        }
+    }
+    Spacer(Modifier.height(10.dp))
 }
 
 @Composable

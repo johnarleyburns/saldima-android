@@ -31,6 +31,7 @@ class XmlBookDocument private constructor(
     private val customerIndex = mutableMapOf<Guid, XmlNode>()
     private val invoiceIndex = mutableMapOf<Guid, XmlNode>()
     private val vendorIndex = mutableMapOf<Guid, XmlNode>()
+    private val scheduledTransactionIndex = mutableMapOf<Guid, XmlNode>()
 
     init {
         reindex()
@@ -42,6 +43,7 @@ class XmlBookDocument private constructor(
         customerIndex.clear()
         invoiceIndex.clear()
         vendorIndex.clear()
+        scheduledTransactionIndex.clear()
         for (node in children(book, "account")) {
             guidValue(node, "id")?.let { accountIndex[it] = node }
         }
@@ -59,6 +61,9 @@ class XmlBookDocument private constructor(
         }
         for (node in children(book, "GncVendor")) {
             guidValue(node, "guid")?.let { vendorIndex[it] = node }
+        }
+        for (node in children(book, "schedxaction")) {
+            guidValue(node, "id")?.let { scheduledTransactionIndex[it] = node }
         }
     }
 
@@ -82,6 +87,24 @@ class XmlBookDocument private constructor(
             "xmlns:entry" to "http://www.gnucash.org/XML/entry",
             "xmlns:owner" to "http://www.gnucash.org/XML/owner",
         )
+
+        /**
+         * Desktop GnuCash's own `recurrencePeriodTypeToString`/`FromString`
+         * (`libgnucash/engine/Recurrence.cpp`) -- note the spaces, not
+         * underscores, in three of these: verified against real GnuCash
+         * source (and against the web track's own port of it).
+         */
+        private val PERIOD_TYPE_TO_XML = mapOf(
+            PeriodType.ONCE to "once",
+            PeriodType.DAY to "day",
+            PeriodType.WEEK to "week",
+            PeriodType.MONTH to "month",
+            PeriodType.END_OF_MONTH to "end of month",
+            PeriodType.NTH_WEEKDAY to "nth weekday",
+            PeriodType.LAST_WEEKDAY to "last weekday",
+            PeriodType.YEAR to "year",
+        )
+        private val PERIOD_TYPE_FROM_XML = PERIOD_TYPE_TO_XML.entries.associate { (key, value) -> value to key }
 
         fun parse(bytes: ByteArray): XmlBookDocument {
             val root = parseTree(ByteArrayInputStream(bytes))
@@ -756,6 +779,457 @@ class XmlBookDocument private constructor(
         val node = transactionIndex[guid] ?: return
         node.detach()
         transactionIndex.remove(guid)
+    }
+
+    // MARK: - Scheduled transactions (GncSchedXaction)
+
+    fun scheduledTransactions(): List<XmlScheduledTransaction> =
+        scheduledTransactionIndex.values.mapNotNull(::scheduledTransactionRow)
+
+    fun scheduledTransaction(guid: Guid): XmlScheduledTransaction? =
+        scheduledTransactionIndex[guid]?.let(::scheduledTransactionRow)
+
+    private fun scheduledTransactionRow(node: XmlNode): XmlScheduledTransaction? {
+        val guid = guidValue(node, "id") ?: return null
+        val name = firstChild(node, "name")?.text ?: ""
+        val enabled = firstChild(node, "enabled")?.text != "n"
+        val autoCreate = firstChild(node, "autoCreate")?.text == "y"
+        val autoCreateNotify = firstChild(node, "autoCreateNotify")?.text == "y"
+        val advanceCreateDays = firstChild(node, "advanceCreateDays")?.text?.toIntOrNull() ?: 0
+        val advanceRemindDays = firstChild(node, "advanceRemindDays")?.text?.toIntOrNull() ?: 0
+        val instanceCount = firstChild(node, "instanceCount")?.text?.toIntOrNull() ?: 0
+        val start = readGdate(node, "start") ?: ""
+        val lastOccurred = readGdate(node, "last")
+        val numOccur = firstChild(node, "num-occur")?.text?.toIntOrNull()
+        val endDate = readGdate(node, "end")
+        val end = when {
+            numOccur != null -> ScheduledEnd.Occurrences(numOccur)
+            endDate != null -> ScheduledEnd.OnDate(endDate)
+            else -> null
+        }
+        val templateAccountGuid = guidValue(node, "templ-acct") ?: return null
+
+        val scheduleNode = firstChild(node, "schedule")
+        val recurrenceNode = scheduleNode?.let { firstChild(it, "recurrence") }
+        val multiplier = recurrenceNode?.let { firstChild(it, "mult")?.text?.toIntOrNull() } ?: 1
+        val periodTypeXml = recurrenceNode?.let { firstChild(it, "period_type")?.text } ?: "once"
+        val periodType = PERIOD_TYPE_FROM_XML[periodTypeXml] ?: PeriodType.ONCE
+        val recurrenceStart = recurrenceNode?.let { readGdate(it, "start") } ?: start
+        val weekendAdjust = when (recurrenceNode?.let { firstChild(it, "weekend_adj")?.text }) {
+            "back" -> WeekendAdjust.BACK
+            "forward" -> WeekendAdjust.FORWARD
+            else -> WeekendAdjust.NONE
+        }
+
+        val templateTransactionNode = findTemplateTransactionNode(templateAccountGuid)
+        var description = ""
+        var currencyCode = "USD"
+        val templateSplits = mutableListOf<XmlScheduledSplit>()
+        if (templateTransactionNode != null) {
+            description = firstChild(templateTransactionNode, "description")?.text ?: ""
+            currencyCode = firstChild(templateTransactionNode, "currency")
+                ?.let { firstChild(it, "id")?.text } ?: currencyCode
+            val splitsContainer = firstChild(templateTransactionNode, "splits") ?: templateTransactionNode
+            for (splitNode in children(splitsContainer, "split")) {
+                val frame = readFrameSlotEntries(splitNode, "sched-xaction")
+                val realAccountGuid = frame["account"]?.let(::guidOrNull) ?: continue
+                val debitNumeric = frame["debit-numeric"]?.let(::rational)
+                val creditNumeric = frame["credit-numeric"]?.let(::rational)
+                val value = when {
+                    debitNumeric != null && debitNumeric.num != 0L -> debitNumeric
+                    creditNumeric != null && creditNumeric.num != 0L -> Money(-creditNumeric.num, creditNumeric.denom)
+                    else -> Money(0, 1)
+                }
+                templateSplits += XmlScheduledSplit(realAccountGuid, value)
+            }
+        }
+
+        return XmlScheduledTransaction(
+            guid = guid,
+            name = name,
+            description = description,
+            currencyCode = currencyCode,
+            enabled = enabled,
+            autoCreate = autoCreate,
+            autoCreateNotify = autoCreateNotify,
+            advanceCreateDays = advanceCreateDays,
+            advanceRemindDays = advanceRemindDays,
+            start = start,
+            lastOccurred = lastOccurred,
+            instanceCount = instanceCount,
+            end = end,
+            recurrence = Recurrence(periodType, multiplier, recurrenceStart, weekendAdjust),
+            templateAccountGuid = templateAccountGuid,
+            templateSplits = templateSplits,
+        )
+    }
+
+    /**
+     * Creates a scheduled transaction: a recurrence rule plus a template of
+     * splits, matching desktop GnuCash's own on-disk shape exactly -- a
+     * hidden, per-schedule template account (type `BANK`, named after its
+     * own guid) under the one shared, book-wide "Template Root" account; a
+     * template `gnc:transaction` whose splits point at that template
+     * account (never the real one); and a `sched-xaction` KVP frame on each
+     * split carrying the real account and amount. Both sides of every
+     * split's KVP (`credit-*`/`debit-*`) are always written, matching real
+     * GnuCash -- the unused side is an empty formula and a zero numeric,
+     * never omitted. Amount formulas are always a plain decimal number in
+     * this engine (Milestone 1: no algebraic formula evaluation).
+     */
+    fun createScheduledTransaction(
+        guid: Guid,
+        name: String,
+        description: String,
+        currencyCode: String,
+        start: String,
+        recurrence: Recurrence,
+        templateSplits: List<Triple<Guid, Money, Guid>>,
+        templateAccountGuid: Guid,
+        templateTransactionGuid: Guid,
+        enabled: Boolean = true,
+        autoCreate: Boolean = false,
+        autoCreateNotify: Boolean = false,
+        advanceCreateDays: Int = 0,
+        advanceRemindDays: Int = 0,
+        end: ScheduledEnd? = null,
+        templateRootGuid: Guid? = null,
+    ): XmlScheduledTransaction {
+        if (scheduledTransactionIndex.containsKey(guid)) {
+            throw BookFormatException("duplicate scheduled transaction ${guid.raw}")
+        }
+        if (templateSplits.size < 2) {
+            throw BookFormatException("a scheduled transaction needs at least two template splits")
+        }
+        var total = Money.ZERO
+        for ((_, value, _) in templateSplits) total = Money.add(total, value)
+        if (total != Money.ZERO) {
+            throw BookFormatException("template split values must sum to zero")
+        }
+
+        val templateTransactionsNode = findOrCreateTemplateTransactionsNode()
+        val templateRootNode = findOrCreateTemplateRootNode(templateTransactionsNode, templateRootGuid)
+        val templateRootGuidValue = guidValue(templateRootNode, "id")
+            ?: throw BookFormatException("template root is missing an id")
+        val templateAccountXml = createTemplateAccountNode(templateAccountGuid, templateRootGuidValue)
+        templateTransactionsNode.addChild(templateAccountXml)
+
+        val fraction = currencyFraction(currencyCode)
+        val splitNodes = templateSplits.map { (accountGuid, value, splitGuid) ->
+            val isDebit = value.num >= 0L
+            val magnitude = if (isDebit) value else value.negated()
+            val formulaText = magnitude.formatted(magnitude.denom)
+            val numericText = "${magnitude.num}/${magnitude.denom}"
+            val debitFormula = if (isDebit) formulaText else ""
+            val creditFormula = if (isDebit) "" else formulaText
+            val debitNumeric = if (isDebit) numericText else "0/1"
+            val creditNumeric = if (isDebit) "0/1" else numericText
+
+            val splitNode = XmlNode("trn:split")
+            splitNode.addChild(leaf("split:id", splitGuid.raw, "type" to "guid"))
+            splitNode.addChild(leaf("split:reconciled-state", "n"))
+            splitNode.addChild(leaf("split:value", "0/$fraction"))
+            splitNode.addChild(leaf("split:quantity", "0/1"))
+            splitNode.addChild(leaf("split:account", templateAccountGuid.raw, "type" to "guid"))
+            val slots = XmlNode("split:slots")
+            val schedSlot = XmlNode("slot")
+            schedSlot.addChild(leaf("slot:key", "sched-xaction"))
+            schedSlot.addChild(
+                frameSlotValue(
+                    listOf(
+                        Triple("account", "guid", accountGuid.raw),
+                        Triple("credit-formula", "string", creditFormula),
+                        Triple("credit-numeric", "numeric", creditNumeric),
+                        Triple("debit-formula", "string", debitFormula),
+                        Triple("debit-numeric", "numeric", debitNumeric),
+                    ),
+                ),
+            )
+            slots.addChild(schedSlot)
+            splitNode.addChild(slots)
+            splitNode
+        }
+
+        val templateTransactionNode = XmlNode("gnc:transaction")
+        templateTransactionNode.attributes["version"] = "2.0.0"
+        templateTransactionNode.addChild(leaf("trn:id", templateTransactionGuid.raw, "type" to "guid"))
+        val currencyNode = XmlNode("trn:currency")
+        currencyNode.addChild(leaf("cmdty:space", "CURRENCY"))
+        currencyNode.addChild(leaf("cmdty:id", currencyCode))
+        templateTransactionNode.addChild(currencyNode)
+        val posted = XmlNode("trn:date-posted")
+        posted.addChild(leaf("ts:date", "$start 00:00:00 +0000"))
+        templateTransactionNode.addChild(posted)
+        val entered = XmlNode("trn:date-entered")
+        entered.addChild(leaf("ts:date", "$start 00:00:00 +0000"))
+        templateTransactionNode.addChild(entered)
+        templateTransactionNode.addChild(leaf("trn:description", description))
+        val splitsNode = XmlNode("trn:splits")
+        for (splitNode in splitNodes) splitsNode.addChild(splitNode)
+        templateTransactionNode.addChild(splitsNode)
+        templateTransactionsNode.addChild(templateTransactionNode)
+
+        val sxNode = XmlNode("gnc:schedxaction")
+        sxNode.attributes["version"] = "2.0.0"
+        sxNode.addChild(leaf("sx:id", guid.raw, "type" to "guid"))
+        sxNode.addChild(leaf("sx:name", name))
+        sxNode.addChild(leaf("sx:enabled", if (enabled) "y" else "n"))
+        sxNode.addChild(leaf("sx:autoCreate", if (autoCreate) "y" else "n"))
+        sxNode.addChild(leaf("sx:autoCreateNotify", if (autoCreateNotify) "y" else "n"))
+        sxNode.addChild(leaf("sx:advanceCreateDays", advanceCreateDays.toString()))
+        sxNode.addChild(leaf("sx:advanceRemindDays", advanceRemindDays.toString()))
+        sxNode.addChild(leaf("sx:instanceCount", "0"))
+        sxNode.addChild(gdateNode("sx:start", start))
+        when (end) {
+            is ScheduledEnd.Occurrences -> {
+                sxNode.addChild(leaf("sx:num-occur", end.count.toString()))
+                sxNode.addChild(leaf("sx:rem-occur", end.count.toString()))
+            }
+            is ScheduledEnd.OnDate -> sxNode.addChild(gdateNode("sx:end", end.date))
+            null -> Unit
+        }
+        sxNode.addChild(leaf("sx:templ-acct", templateAccountGuid.raw, "type" to "guid"))
+        val recurrenceNode = XmlNode("gnc:recurrence")
+        recurrenceNode.attributes["version"] = "1.0.0"
+        recurrenceNode.addChild(leaf("recurrence:mult", recurrence.multiplier.toString()))
+        recurrenceNode.addChild(leaf("recurrence:period_type", PERIOD_TYPE_TO_XML.getValue(recurrence.periodType)))
+        recurrenceNode.addChild(gdateNode("recurrence:start", recurrence.start))
+        if (recurrence.weekendAdjust != WeekendAdjust.NONE) {
+            recurrenceNode.addChild(leaf("recurrence:weekend_adj", recurrence.weekendAdjust.name.lowercase()))
+        }
+        val scheduleNode = XmlNode("sx:schedule")
+        scheduleNode.addChild(recurrenceNode)
+        sxNode.addChild(scheduleNode)
+
+        book.addChild(sxNode)
+        scheduledTransactionIndex[guid] = sxNode
+        return scheduledTransactionRow(sxNode) ?: throw BookFormatException("failed to build scheduled transaction")
+    }
+
+    fun updateScheduledTransaction(
+        guid: Guid,
+        name: String? = null,
+        enabled: Boolean? = null,
+        autoCreate: Boolean? = null,
+        autoCreateNotify: Boolean? = null,
+        advanceCreateDays: Int? = null,
+        advanceRemindDays: Int? = null,
+    ): XmlScheduledTransaction {
+        val node = scheduledTransactionIndex[guid]
+            ?: throw BookFormatException("unknown scheduled transaction ${guid.raw}")
+        name?.let { setChildText(node, "name", "sx:name", it) }
+        enabled?.let { setChildText(node, "enabled", "sx:enabled", if (it) "y" else "n") }
+        autoCreate?.let { setChildText(node, "autoCreate", "sx:autoCreate", if (it) "y" else "n") }
+        autoCreateNotify?.let { setChildText(node, "autoCreateNotify", "sx:autoCreateNotify", if (it) "y" else "n") }
+        advanceCreateDays?.let { setChildText(node, "advanceCreateDays", "sx:advanceCreateDays", it.toString()) }
+        advanceRemindDays?.let { setChildText(node, "advanceRemindDays", "sx:advanceRemindDays", it.toString()) }
+        return scheduledTransactionRow(node)
+            ?: throw BookFormatException("failed to read scheduled transaction ${guid.raw}")
+    }
+
+    /** Also removes its template account and template transaction. */
+    fun deleteScheduledTransaction(guid: Guid) {
+        val node = scheduledTransactionIndex[guid] ?: return
+        val templateAccountGuid = guidValue(node, "templ-acct")
+        val templateTransactionsNode = findTemplateTransactionsNode()
+        if (templateTransactionsNode != null && templateAccountGuid != null) {
+            findTemplateTransactionNode(templateAccountGuid)?.detach()
+            children(templateTransactionsNode, "account")
+                .firstOrNull { guidValue(it, "id") == templateAccountGuid }
+                ?.detach()
+        }
+        node.detach()
+        scheduledTransactionIndex.remove(guid)
+    }
+
+    /**
+     * Every enabled schedule's due instances as of `asOf`, classified by
+     * what should happen to them -- this is a pure read, it never posts or
+     * mutates anything; the caller is responsible for calling
+     * [postScheduledInstance] for every `AUTO_POST`/`AUTO_POST_NOTIFY`
+     * result and surfacing `NEEDS_APPROVAL`/`REMINDER` ones for the owner
+     * to act on.
+     */
+    fun dueScheduledInstances(asOf: String): List<DueScheduledInstance> {
+        val results = mutableListOf<DueScheduledInstance>()
+        for (sx in scheduledTransactions()) {
+            if (!sx.enabled) continue
+            val occursEnd = sx.end as? ScheduledEnd.Occurrences
+            if (occursEnd != null && sx.instanceCount >= occursEnd.count) continue
+            val createBoundary = addDays(asOf, sx.advanceCreateDays)
+            val remindBoundary = addDays(createBoundary, sx.advanceRemindDays)
+            var current = sx.lastOccurred ?: "0001-01-01"
+            for (guard in 0 until 1000) {
+                val next = nextInstance(sx.recurrence, current) ?: break
+                val dateEnd = sx.end as? ScheduledEnd.OnDate
+                if (dateEnd != null && next > dateEnd.date) break
+                if (next > remindBoundary) break
+                val action = if (next <= createBoundary) {
+                    if (sx.autoCreate) {
+                        if (sx.autoCreateNotify) DueInstanceAction.AUTO_POST_NOTIFY else DueInstanceAction.AUTO_POST
+                    } else {
+                        DueInstanceAction.NEEDS_APPROVAL
+                    }
+                } else {
+                    DueInstanceAction.REMINDER
+                }
+                results += DueScheduledInstance(sx.guid, sx.name, next, action)
+                if (action == DueInstanceAction.REMINDER) break
+                current = next
+            }
+        }
+        return results
+    }
+
+    /** Posts a real transaction from the template and advances `sx:last`. */
+    fun postScheduledInstance(
+        scheduledTransactionGuid: Guid,
+        date: String,
+        transactionGuid: Guid,
+        splitGuids: List<Guid>,
+    ): SnapshotTransaction {
+        val sx = scheduledTransaction(scheduledTransactionGuid)
+            ?: throw BookFormatException("unknown scheduled transaction ${scheduledTransactionGuid.raw}")
+        val result = postTransaction(
+            guid = transactionGuid,
+            date = date,
+            description = sx.description,
+            splits = sx.templateSplits.mapIndexed { index, split ->
+                Triple(split.accountGuid, split.value, splitGuids[index])
+            },
+        )
+        advanceScheduledTransaction(scheduledTransactionGuid, date)
+        return result
+    }
+
+    /** Advances `sx:last` past this instance without posting anything -- Milestone 1's "skip". */
+    fun skipScheduledInstance(scheduledTransactionGuid: Guid, date: String) {
+        if (!scheduledTransactionIndex.containsKey(scheduledTransactionGuid)) {
+            throw BookFormatException("unknown scheduled transaction ${scheduledTransactionGuid.raw}")
+        }
+        advanceScheduledTransaction(scheduledTransactionGuid, date)
+    }
+
+    private fun advanceScheduledTransaction(guid: Guid, date: String) {
+        val node = scheduledTransactionIndex[guid] ?: return
+        val existingLast = firstChild(node, "last")
+        if (existingLast != null) {
+            val gdate = firstChild(existingLast, "gdate")
+            if (gdate != null) gdate.text = date else existingLast.addChild(leaf("gdate", date))
+        } else {
+            val startNode = firstChild(node, "start")
+            val insertAt = startNode?.indexInParent()?.plus(1) ?: node.children.size
+            node.insertChild(gdateNode("sx:last", date), insertAt)
+        }
+        val instanceCount = firstChild(node, "instanceCount")?.text?.toIntOrNull() ?: 0
+        setChildText(node, "instanceCount", "sx:instanceCount", (instanceCount + 1).toString())
+    }
+
+    private fun findTemplateTransactionsNode(): XmlNode? = firstChild(book, "template-transactions")
+
+    private fun findOrCreateTemplateTransactionsNode(): XmlNode {
+        findTemplateTransactionsNode()?.let { return it }
+        val created = XmlNode("gnc:template-transactions")
+        book.addChild(created)
+        return created
+    }
+
+    /**
+     * The single, book-wide hidden "Template Root" account every scheduled
+     * transaction's own template account lives under, matching desktop
+     * GnuCash's `gnc_book_get_template_root`. Created the first time any
+     * scheduled transaction is made; `templateRootGuid` is only used then.
+     */
+    private fun findOrCreateTemplateRootNode(templateTransactionsNode: XmlNode, templateRootGuid: Guid?): XmlNode {
+        val existing = children(templateTransactionsNode, "account")
+            .firstOrNull { firstChild(it, "type")?.text == "ROOT" }
+        if (existing != null) return existing
+        val guid = templateRootGuid ?: throw BookFormatException(
+            "creating the first scheduled transaction in this book requires a template-root id",
+        )
+        val created = newTemplateAccountNode(guid, "Template Root", "ROOT", null)
+        templateTransactionsNode.addChild(created)
+        return created
+    }
+
+    /** Named after its own guid, like real GnuCash -- never shown to a user. */
+    private fun createTemplateAccountNode(guid: Guid, parentGuid: Guid): XmlNode =
+        newTemplateAccountNode(guid, guid.raw, "BANK", parentGuid)
+
+    /**
+     * Shared builder for the Template Root and every per-schedule template
+     * account: commodity space/id `"template"`/`"template"`, scu `1` --
+     * distinct from `accountNode()`, which always hardcodes a `CURRENCY`
+     * commodity.
+     */
+    private fun newTemplateAccountNode(guid: Guid, name: String, type: String, parentGuid: Guid?): XmlNode {
+        val node = XmlNode("gnc:account")
+        node.attributes["version"] = "2.0.0"
+        node.addChild(leaf("act:name", name))
+        node.addChild(leaf("act:id", guid.raw, "type" to "guid"))
+        node.addChild(leaf("act:type", type))
+        val commodity = XmlNode("act:commodity")
+        commodity.addChild(leaf("cmdty:space", "template"))
+        commodity.addChild(leaf("cmdty:id", "template"))
+        node.addChild(commodity)
+        node.addChild(leaf("act:commodity-scu", "1"))
+        parentGuid?.let { node.addChild(leaf("act:parent", it.raw, "type" to "guid")) }
+        return node
+    }
+
+    private fun findTemplateTransactionNode(templateAccountGuid: Guid): XmlNode? {
+        val templateTransactionsNode = findTemplateTransactionsNode() ?: return null
+        return children(templateTransactionsNode, "transaction").firstOrNull { transactionNode ->
+            val splitsContainer = firstChild(transactionNode, "splits") ?: transactionNode
+            children(splitsContainer, "split").any { guidValue(it, "account") == templateAccountGuid }
+        }
+    }
+
+    /** Matches an existing `CURRENCY` commodity's own fraction; falls back to the conventional 100 (cents). */
+    private fun currencyFraction(currencyCode: String): Long {
+        val match = children(book, "commodity").firstOrNull {
+            firstChild(it, "space")?.text == "CURRENCY" && firstChild(it, "id")?.text == currencyCode
+        }
+        return match?.let { firstChild(it, "fraction")?.text?.toLongOrNull() } ?: 100L
+    }
+
+    private fun gdateNode(tag: String, date: String): XmlNode {
+        val node = XmlNode(tag)
+        node.addChild(leaf("gdate", date))
+        return node
+    }
+
+    private fun readGdate(parent: XmlNode, tag: String): String? {
+        val wrapper = firstChild(parent, tag) ?: return null
+        return firstChild(wrapper, "gdate")?.text
+    }
+
+    /** A KVP frame value: `<slot:value type="frame">` wrapping its own nested `<slot>` entries. */
+    private fun frameSlotValue(entries: List<Triple<String, String, String>>): XmlNode {
+        val value = XmlNode("slot:value")
+        value.attributes["type"] = "frame"
+        for ((key, type, text) in entries) {
+            val slot = XmlNode("slot")
+            slot.addChild(leaf("slot:key", key))
+            slot.addChild(leaf("slot:value", text, "type" to type))
+            value.addChild(slot)
+        }
+        return value
+    }
+
+    /** Reads a nested KVP frame slot (e.g. `sched-xaction`) as a flat key -> text map. */
+    private fun readFrameSlotEntries(owner: XmlNode, frameKey: String): Map<String, String> {
+        val slots = firstChild(owner, "slots") ?: return emptyMap()
+        val frameSlot = children(slots, "slot").firstOrNull { firstChild(it, "key")?.text == frameKey }
+            ?: return emptyMap()
+        val frameValue = firstChild(frameSlot, "value") ?: return emptyMap()
+        val entries = mutableMapOf<String, String>()
+        for (entry in children(frameValue, "slot")) {
+            val key = firstChild(entry, "key")?.text
+            val entryValue = firstChild(entry, "value")?.text
+            if (key != null && entryValue != null) entries[key] = entryValue
+        }
+        return entries
     }
 
     // MARK: - Customers (GncCustomer)

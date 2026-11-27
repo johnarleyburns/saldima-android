@@ -5,18 +5,24 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.net.Uri
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.FileProvider
 import guru.parso.saldima.core.AccountType
 import guru.parso.saldima.core.BookFiles
 import guru.parso.saldima.core.BookFormat
+import guru.parso.saldima.core.BookFormatException
 import guru.parso.saldima.core.BookSnapshot
 import guru.parso.saldima.core.CustomerDraft
+import guru.parso.saldima.core.DueInstanceAction
+import guru.parso.saldima.core.DueScheduledInstance
 import guru.parso.saldima.core.Guid
 import guru.parso.saldima.core.IdGenerator
 import guru.parso.saldima.core.Money
+import guru.parso.saldima.core.Recurrence
 import guru.parso.saldima.core.RegisterExportRow
+import guru.parso.saldima.core.ScheduledEnd
 import guru.parso.saldima.core.SqliteBookReader
 import guru.parso.saldima.core.SqliteRows
 import guru.parso.saldima.core.Totals
@@ -27,6 +33,7 @@ import guru.parso.saldima.core.XmlBookDocument
 import guru.parso.saldima.core.XmlCustomer
 import guru.parso.saldima.core.XmlInvoice
 import guru.parso.saldima.core.XmlInvoiceEntry
+import guru.parso.saldima.core.XmlScheduledTransaction
 import guru.parso.saldima.core.XmlVendor
 import guru.parso.saldima.core.registerExportFilename
 import guru.parso.saldima.core.registerExportRows
@@ -64,6 +71,12 @@ class BookRepository(private val context: Context) {
     var vendors by mutableStateOf<List<XmlVendor>>(emptyList())
         private set
     var bills by mutableStateOf<List<XmlBill>>(emptyList())
+        private set
+    var scheduledTransactions by mutableStateOf<List<XmlScheduledTransaction>>(emptyList())
+        private set
+    var dueScheduledReview by mutableStateOf<List<DueScheduledInstance>>(emptyList())
+        private set
+    var autoPostedCount by mutableIntStateOf(0)
         private set
 
     private val directory: File get() = File(context.filesDir, "books").apply { mkdirs() }
@@ -273,6 +286,7 @@ class BookRepository(private val context: Context) {
         invoices = doc.invoices().sortedByDescending { it.dateOpened }
         vendors = doc.vendors().sortedBy { it.name.lowercase() }
         bills = doc.bills().sortedByDescending { it.dateOpened }
+        scheduledTransactions = doc.scheduledTransactions().sortedBy { it.name.lowercase() }
     }
 
     // MARK: - Clients (GncCustomer)
@@ -738,6 +752,182 @@ class BookRepository(private val context: Context) {
             return
         }
         doc.unvoidTransaction(transactionGuid)
+        error = null
+        save()
+    }
+
+    // MARK: - Scheduled transactions (recurring bills, invoices and transfers)
+
+    /**
+     * Creates a scheduled transaction: a recurrence rule plus a template of
+     * splits. Each split takes a signed amount (debit positive, credit
+     * negative); the splits used must sum to zero, same as [post].
+     */
+    fun createScheduledTransaction(
+        name: String,
+        description: String,
+        start: String,
+        recurrence: Recurrence,
+        end: ScheduledEnd?,
+        autoCreate: Boolean,
+        autoCreateNotify: Boolean,
+        advanceCreateDays: Int,
+        advanceRemindDays: Int,
+        templateSplits: List<Pair<Guid, Money>>,
+    ) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        if (name.isBlank()) {
+            error = "Enter a name."
+            return
+        }
+        if (description.isBlank()) {
+            error = "Enter a description."
+            return
+        }
+        if (templateSplits.size < 2) {
+            error = "Use at least two splits."
+            return
+        }
+        val total = templateSplits.fold(Money.ZERO) { sum, (_, value) -> Money.add(sum, value) }
+        if (total != Money.ZERO) {
+            error = "The splits must sum to zero."
+            return
+        }
+        try {
+            doc.createScheduledTransaction(
+                guid = ids.next(),
+                name = name,
+                description = description,
+                currencyCode = snapshot?.currencyCode ?: "USD",
+                start = start,
+                recurrence = recurrence,
+                templateSplits = templateSplits.map { (account, value) -> Triple(account, value, ids.next()) },
+                templateAccountGuid = ids.next(),
+                templateTransactionGuid = ids.next(),
+                autoCreate = autoCreate,
+                autoCreateNotify = autoCreateNotify,
+                advanceCreateDays = advanceCreateDays,
+                advanceRemindDays = advanceRemindDays,
+                end = end,
+                // Ignored by the engine if a Template Root already exists for
+                // this book -- only used the very first time any schedule is made.
+                templateRootGuid = ids.next(),
+            )
+        } catch (failure: BookFormatException) {
+            error = failure.message ?: "Could not create that schedule."
+            return
+        }
+        error = null
+        save()
+    }
+
+    fun updateScheduledTransaction(
+        guid: Guid,
+        name: String,
+        enabled: Boolean,
+        autoCreate: Boolean,
+        autoCreateNotify: Boolean,
+        advanceCreateDays: Int,
+        advanceRemindDays: Int,
+    ) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        if (name.isBlank()) {
+            error = "Enter a name."
+            return
+        }
+        doc.updateScheduledTransaction(
+            guid,
+            name = name,
+            enabled = enabled,
+            autoCreate = autoCreate,
+            autoCreateNotify = autoCreateNotify,
+            advanceCreateDays = advanceCreateDays,
+            advanceRemindDays = advanceRemindDays,
+        )
+        error = null
+        save()
+    }
+
+    fun deleteScheduledTransaction(guid: Guid) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        doc.deleteScheduledTransaction(guid)
+        error = null
+        save()
+    }
+
+    /**
+     * "Check on open": computes every due instance as of `today` and acts on
+     * it -- `AUTO_POST`/`AUTO_POST_NOTIFY` instances post immediately and
+     * silently (notify ones are still listed in [dueScheduledReview], for
+     * visibility); `NEEDS_APPROVAL`/`REMINDER` ones are only listed there for
+     * the caller to act on by hand. This never runs on a schedule or in the
+     * background -- only when this is called (from the journal screen, on
+     * load), mirroring the web track's `processDueScheduledTransactions`.
+     */
+    fun checkDueScheduledTransactions(today: String) {
+        val doc = document ?: return
+        val due = doc.dueScheduledInstances(today)
+        var posted = 0
+        val review = mutableListOf<DueScheduledInstance>()
+        for (instance in due) {
+            when (instance.action) {
+                DueInstanceAction.AUTO_POST, DueInstanceAction.AUTO_POST_NOTIFY -> {
+                    val sx = doc.scheduledTransaction(instance.scheduledTransactionGuid)
+                    if (sx != null) {
+                        doc.postScheduledInstance(
+                            instance.scheduledTransactionGuid,
+                            instance.date,
+                            ids.next(),
+                            sx.templateSplits.map { ids.next() },
+                        )
+                        posted += 1
+                    }
+                    if (instance.action == DueInstanceAction.AUTO_POST_NOTIFY) review += instance
+                }
+                DueInstanceAction.NEEDS_APPROVAL, DueInstanceAction.REMINDER -> review += instance
+            }
+        }
+        dueScheduledReview = review
+        autoPostedCount = posted
+        if (posted > 0) {
+            error = null
+            save()
+        }
+    }
+
+    /** A `NEEDS_APPROVAL` due instance from the review banner: posts it the same way an auto-created instance would be. */
+    fun approveScheduledInstance(guid: Guid, date: String) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        val sx = doc.scheduledTransaction(guid) ?: run {
+            error = "That scheduled transaction is no longer in the book."
+            return
+        }
+        doc.postScheduledInstance(guid, date, ids.next(), sx.templateSplits.map { ids.next() })
+        dueScheduledReview = dueScheduledReview.filterNot { it.scheduledTransactionGuid == guid && it.date == date }
+        error = null
+        save()
+    }
+
+    /** Permanently skips a due instance without posting it -- Milestone 1 has no "postpone". */
+    fun skipScheduledInstance(guid: Guid, date: String) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        doc.skipScheduledInstance(guid, date)
+        dueScheduledReview = dueScheduledReview.filterNot { it.scheduledTransactionGuid == guid && it.date == date }
         error = null
         save()
     }

@@ -531,4 +531,514 @@ class XmlBookDocumentTest {
         val reparsed = XmlBookDocument.parse(document.serialize())
         assertEquals(3305, reparsed.transactions().size)
     }
+
+    // MARK: - Scheduled transactions
+
+    private fun createMonthlySalary(
+        document: XmlBookDocument,
+        sxGuid: Guid,
+        bank: Guid,
+        salary: Guid,
+    ): XmlScheduledTransaction = document.createScheduledTransaction(
+        guid = sxGuid,
+        name = "Monthly salary",
+        description = "Salary",
+        currencyCode = "USD",
+        start = "2026-01-15",
+        recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-15", WeekendAdjust.NONE),
+        templateSplits = listOf(
+            Triple(bank, Money(50000, 100), Guid.parse("f0".repeat(16))),
+            Triple(salary, Money(-50000, 100), Guid.parse("f1".repeat(16))),
+        ),
+        templateAccountGuid = Guid.parse("d".repeat(32)),
+        templateTransactionGuid = Guid.parse("e".repeat(32)),
+        autoCreate = true,
+        advanceCreateDays = 2,
+        advanceRemindDays = 5,
+        templateRootGuid = Guid.parse("f2".repeat(16)),
+    )
+
+    @Test
+    fun `creates a scheduled transaction matching real GnuCash's on-disk shape, and reads it back`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        val sxGuid = Guid.parse("1".repeat(32))
+        val sx = createMonthlySalary(document, sxGuid, bank, salary)
+
+        assertEquals("Monthly salary", sx.name)
+        assertEquals("Salary", sx.description)
+        assertTrue(sx.enabled)
+        assertTrue(sx.autoCreate)
+        assertFalse(sx.autoCreateNotify)
+        assertEquals(2, sx.advanceCreateDays)
+        assertEquals(5, sx.advanceRemindDays)
+        assertEquals("2026-01-15", sx.start)
+        assertNull(sx.lastOccurred)
+        assertEquals(0, sx.instanceCount)
+        assertNull(sx.end)
+        assertEquals(Recurrence(PeriodType.MONTH, 1, "2026-01-15", WeekendAdjust.NONE), sx.recurrence)
+        assertEquals(
+            listOf(XmlScheduledSplit(bank, Money(50000, 100)), XmlScheduledSplit(salary, Money(-50000, 100))),
+            sx.templateSplits,
+        )
+
+        val serialized = String(document.serialize(), Charsets.UTF_8)
+        assertTrue("<gnc:template-transactions>" in serialized)
+        assertTrue("<act:name>Template Root</act:name>" in serialized)
+        assertTrue("<act:type>ROOT</act:type>" in serialized)
+        assertTrue("<cmdty:space>template</cmdty:space>" in serialized)
+        assertTrue("<recurrence:period_type>month</recurrence:period_type>" in serialized)
+        assertTrue("<slot:key>sched-xaction</slot:key>" in serialized)
+        assertTrue("<slot:key>debit-formula</slot:key>" in serialized)
+        // The unused side of each split's KVP is an empty formula and a zero
+        // numeric, not omitted -- matching real GnuCash exactly.
+        assertTrue("<slot:key>credit-formula</slot:key><slot:value type=\"string\"/>" in serialized)
+        assertTrue(
+            "<slot:key>credit-numeric</slot:key><slot:value type=\"numeric\">0/1</slot:value>" in serialized,
+        )
+
+        // Not a normal account/transaction: stays out of the everyday lists.
+        assertFalse(document.accounts().any { it.guid == sx.templateAccountGuid })
+        assertEquals(1, document.transactions().size) // only the fixture's own pre-existing one
+
+        val reparsed = XmlBookDocument.parse(document.serialize())
+        assertEquals(sx, reparsed.scheduledTransaction(sxGuid))
+    }
+
+    @Test
+    fun `shares one Template Root across multiple scheduled transactions`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        createMonthlySalary(document, Guid.parse("1".repeat(32)), bank, salary)
+
+        val second = document.createScheduledTransaction(
+            guid = Guid.parse("2".repeat(32)),
+            name = "Rent",
+            description = "Rent",
+            currencyCode = "USD",
+            start = "2026-02-01",
+            recurrence = Recurrence(PeriodType.MONTH, 1, "2026-02-01", WeekendAdjust.NONE),
+            templateSplits = listOf(
+                Triple(salary, Money(120000, 100), Guid.parse("a0".repeat(16))),
+                Triple(bank, Money(-120000, 100), Guid.parse("a1".repeat(16))),
+            ),
+            templateAccountGuid = Guid.parse("3".repeat(32)),
+            templateTransactionGuid = Guid.parse("4".repeat(32)),
+            // No templateRootGuid -- must reuse the one the first SX created.
+        )
+        assertEquals(2, document.scheduledTransactions().size)
+        val serialized = String(document.serialize(), Charsets.UTF_8)
+        val rootCount = Regex("<act:type>ROOT</act:type>").findAll(serialized).count()
+        assertEquals(2, rootCount) // the fixture's own book root + one shared template root
+        assertTrue(second.enabled)
+        assertFalse(second.autoCreate)
+    }
+
+    @Test
+    fun `refuses to create the first scheduled transaction without a template-root id, an unbalanced template, too few splits, or a duplicate guid`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+
+        assertFailsWith<BookFormatException> {
+            document.createScheduledTransaction(
+                guid = Guid.parse("1".repeat(32)),
+                name = "x",
+                description = "x",
+                currencyCode = "USD",
+                start = "2026-01-01",
+                recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-01", WeekendAdjust.NONE),
+                templateSplits = listOf(
+                    Triple(bank, Money(100, 100), Guid.parse("f0".repeat(16))),
+                    Triple(salary, Money(-100, 100), Guid.parse("f1".repeat(16))),
+                ),
+                templateAccountGuid = Guid.parse("d".repeat(32)),
+                templateTransactionGuid = Guid.parse("e".repeat(32)),
+                // No templateRootGuid, and none exists yet.
+            )
+        }
+
+        assertFailsWith<BookFormatException> {
+            document.createScheduledTransaction(
+                guid = Guid.parse("1".repeat(32)),
+                name = "x",
+                description = "x",
+                currencyCode = "USD",
+                start = "2026-01-01",
+                recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-01", WeekendAdjust.NONE),
+                templateSplits = listOf(Triple(bank, Money(100, 100), Guid.parse("f0".repeat(16)))),
+                templateAccountGuid = Guid.parse("d".repeat(32)),
+                templateTransactionGuid = Guid.parse("e".repeat(32)),
+                templateRootGuid = Guid.parse("f2".repeat(16)),
+            )
+        }
+
+        assertFailsWith<BookFormatException> {
+            document.createScheduledTransaction(
+                guid = Guid.parse("1".repeat(32)),
+                name = "x",
+                description = "x",
+                currencyCode = "USD",
+                start = "2026-01-01",
+                recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-01", WeekendAdjust.NONE),
+                templateSplits = listOf(
+                    Triple(bank, Money(100, 100), Guid.parse("f0".repeat(16))),
+                    Triple(salary, Money(-99, 100), Guid.parse("f1".repeat(16))),
+                ),
+                templateAccountGuid = Guid.parse("d".repeat(32)),
+                templateTransactionGuid = Guid.parse("e".repeat(32)),
+                templateRootGuid = Guid.parse("f2".repeat(16)),
+            )
+        }
+
+        createMonthlySalary(document, Guid.parse("1".repeat(32)), bank, salary)
+        assertFailsWith<BookFormatException> { createMonthlySalary(document, Guid.parse("1".repeat(32)), bank, salary) }
+    }
+
+    @Test
+    fun `updates the simple fields of a scheduled transaction, and rejects an unknown guid`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        val sxGuid = Guid.parse("1".repeat(32))
+        createMonthlySalary(document, sxGuid, bank, salary)
+
+        val updated = document.updateScheduledTransaction(
+            sxGuid,
+            name = "Renamed",
+            enabled = false,
+            autoCreate = false,
+            autoCreateNotify = true,
+            advanceCreateDays = 10,
+            advanceRemindDays = 20,
+        )
+        assertEquals("Renamed", updated.name)
+        assertFalse(updated.enabled)
+        assertFalse(updated.autoCreate)
+        assertTrue(updated.autoCreateNotify)
+        assertEquals(10, updated.advanceCreateDays)
+        assertEquals(20, updated.advanceRemindDays)
+
+        assertFailsWith<BookFormatException> {
+            document.updateScheduledTransaction(Guid.parse("f".repeat(32)), name = "x")
+        }
+
+        // A partial update leaves every other field untouched.
+        val partial = document.updateScheduledTransaction(sxGuid, name = "Renamed again")
+        assertEquals("Renamed again", partial.name)
+        assertFalse(partial.enabled)
+        assertFalse(partial.autoCreate)
+        assertTrue(partial.autoCreateNotify)
+        assertEquals(10, partial.advanceCreateDays)
+        assertEquals(20, partial.advanceRemindDays)
+    }
+
+    @Test
+    fun `round-trips a weekend-adjusted recurrence`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        val sxGuid = Guid.parse("1".repeat(32))
+        val sx = document.createScheduledTransaction(
+            guid = sxGuid,
+            name = "Weekend adjusted",
+            description = "Weekend adjusted",
+            currencyCode = "USD",
+            start = "2026-01-15",
+            recurrence = Recurrence(PeriodType.WEEK, 1, "2026-01-15", WeekendAdjust.FORWARD),
+            templateSplits = listOf(
+                Triple(bank, Money(100, 100), Guid.parse("f0".repeat(16))),
+                Triple(salary, Money(-100, 100), Guid.parse("f1".repeat(16))),
+            ),
+            templateAccountGuid = Guid.parse("d".repeat(32)),
+            templateTransactionGuid = Guid.parse("e".repeat(32)),
+            templateRootGuid = Guid.parse("f2".repeat(16)),
+        )
+        assertEquals(WeekendAdjust.FORWARD, sx.recurrence.weekendAdjust)
+        val reparsed = XmlBookDocument.parse(document.serialize())
+        assertEquals(WeekendAdjust.FORWARD, reparsed.scheduledTransaction(sxGuid)?.recurrence?.weekendAdjust)
+    }
+
+    @Test
+    fun `can be created disabled, with autoCreateNotify on, and in a currency with no commodity entry yet`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        val sx = document.createScheduledTransaction(
+            guid = Guid.parse("1".repeat(32)),
+            name = "Disabled, notify-on-create, unknown currency",
+            description = "x",
+            currencyCode = "GBP",
+            enabled = false,
+            autoCreate = true,
+            autoCreateNotify = true,
+            start = "2026-01-15",
+            recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-15", WeekendAdjust.NONE),
+            templateSplits = listOf(
+                Triple(bank, Money(100, 100), Guid.parse("f0".repeat(16))),
+                Triple(salary, Money(-100, 100), Guid.parse("f1".repeat(16))),
+            ),
+            templateAccountGuid = Guid.parse("d".repeat(32)),
+            templateTransactionGuid = Guid.parse("e".repeat(32)),
+            templateRootGuid = Guid.parse("f2".repeat(16)),
+        )
+        assertFalse(sx.enabled)
+        assertTrue(sx.autoCreate)
+        assertTrue(sx.autoCreateNotify)
+        // A currency with no existing commodity entry falls back to the
+        // conventional 100 (cents) fraction for the zero placeholder value.
+        assertTrue("<split:value>0/100</split:value>" in String(document.serialize(), Charsets.UTF_8))
+    }
+
+    @Test
+    fun `uses an existing commodity's own fraction for the zero placeholder value`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        document.createScheduledTransaction(
+            guid = Guid.parse("1".repeat(32)),
+            name = "Euro schedule",
+            description = "x",
+            currencyCode = "USD",
+            start = "2026-01-15",
+            recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-15", WeekendAdjust.NONE),
+            templateSplits = listOf(
+                Triple(bank, Money(100, 100), Guid.parse("f0".repeat(16))),
+                Triple(salary, Money(-100, 100), Guid.parse("f1".repeat(16))),
+            ),
+            templateAccountGuid = Guid.parse("d".repeat(32)),
+            templateTransactionGuid = Guid.parse("e".repeat(32)),
+            templateRootGuid = Guid.parse("f2".repeat(16)),
+        )
+        assertTrue("<split:value>0/100</split:value>" in String(document.serialize(), Charsets.UTF_8))
+    }
+
+    @Test
+    fun `defaults missing schedule and template data when reading a hand-written scheduled transaction`() {
+        val document = XmlBookDocument.parse(
+            """<?xml version="1.0" encoding="utf-8" ?>
+<gnc-v2 xmlns:gnc="http://www.gnucash.org/XML/gnc" xmlns:book="http://www.gnucash.org/XML/book" xmlns:sx="http://www.gnucash.org/XML/sx">
+<gnc:book version="2.0.0">
+<book:id type="guid">${"9".repeat(32)}</book:id>
+<gnc:schedxaction version="2.0.0">
+  <sx:id type="guid">${"1".repeat(32)}</sx:id>
+  <sx:name>Minimal</sx:name>
+  <sx:advanceCreateDays>0</sx:advanceCreateDays>
+  <sx:advanceRemindDays>0</sx:advanceRemindDays>
+  <sx:instanceCount>0</sx:instanceCount>
+  <sx:start><gdate>2026-01-01</gdate></sx:start>
+  <sx:templ-acct type="guid">${"f".repeat(32)}</sx:templ-acct>
+</gnc:schedxaction>
+</gnc:book>
+</gnc-v2>""".toByteArray(Charsets.UTF_8),
+        )
+        val sx = assertNotNull(document.scheduledTransaction(Guid.parse("1".repeat(32))))
+        assertEquals("Minimal", sx.name)
+        assertEquals("", sx.description)
+        assertEquals("USD", sx.currencyCode)
+        assertTrue(sx.enabled)
+        assertFalse(sx.autoCreate)
+        assertFalse(sx.autoCreateNotify)
+        assertEquals(Recurrence(PeriodType.ONCE, 1, "2026-01-01", WeekendAdjust.NONE), sx.recurrence)
+        assertEquals(emptyList(), sx.templateSplits)
+    }
+
+    @Test
+    fun `posts a due instance, advancing sx last and instanceCount, and rejects an unknown guid`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        val sxGuid = Guid.parse("1".repeat(32))
+        createMonthlySalary(document, sxGuid, bank, salary)
+
+        val posted = document.postScheduledInstance(
+            sxGuid,
+            "2026-01-15",
+            Guid.parse("9".repeat(32)),
+            listOf(Guid.parse("b0".repeat(16)), Guid.parse("b1".repeat(16))),
+        )
+        assertEquals("Salary", posted.description)
+        assertEquals(
+            listOf(bank to Money(50000, 100), salary to Money(-50000, 100)),
+            posted.splits.map { it.accountGuid to it.value },
+        )
+
+        val advanced = assertNotNull(document.scheduledTransaction(sxGuid))
+        assertEquals("2026-01-15", advanced.lastOccurred)
+        assertEquals(1, advanced.instanceCount)
+
+        // Posting again updates sx:last in place rather than duplicating it.
+        document.postScheduledInstance(
+            sxGuid,
+            "2026-02-15",
+            Guid.parse("a".repeat(32)),
+            listOf(Guid.parse("d0".repeat(16)), Guid.parse("d1".repeat(16))),
+        )
+        val advancedAgain = assertNotNull(document.scheduledTransaction(sxGuid))
+        assertEquals("2026-02-15", advancedAgain.lastOccurred)
+        assertEquals(2, advancedAgain.instanceCount)
+
+        assertFailsWith<BookFormatException> {
+            document.postScheduledInstance(Guid.parse("f".repeat(32)), "2026-01-01", Guid.parse("c".repeat(32)), emptyList())
+        }
+    }
+
+    @Test
+    fun `skips a due instance, advancing sx last without posting anything, and rejects an unknown guid`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        val sxGuid = Guid.parse("1".repeat(32))
+        createMonthlySalary(document, sxGuid, bank, salary)
+        val transactionCountBefore = document.transactions().size
+
+        document.skipScheduledInstance(sxGuid, "2026-01-15")
+        val advanced = assertNotNull(document.scheduledTransaction(sxGuid))
+        assertEquals("2026-01-15", advanced.lastOccurred)
+        assertEquals(1, advanced.instanceCount)
+        assertEquals(transactionCountBefore, document.transactions().size)
+
+        assertFailsWith<BookFormatException> {
+            document.skipScheduledInstance(Guid.parse("f".repeat(32)), "2026-01-01")
+        }
+    }
+
+    @Test
+    fun `classifies due instances as auto-post, auto-post-notify, needs-approval or reminder`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+
+        // Auto-posts silently: due within advanceCreateDays, autoCreate on, no notify.
+        val autoPost = document.createScheduledTransaction(
+            guid = Guid.parse("1".repeat(32)),
+            name = "Auto",
+            description = "Auto",
+            currencyCode = "USD",
+            start = "2026-01-15",
+            recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-15", WeekendAdjust.NONE),
+            templateSplits = listOf(
+                Triple(bank, Money(100, 100), Guid.parse("f0".repeat(16))),
+                Triple(salary, Money(-100, 100), Guid.parse("f1".repeat(16))),
+            ),
+            templateAccountGuid = Guid.parse("d1".repeat(16)),
+            templateTransactionGuid = Guid.parse("e1".repeat(16)),
+            autoCreate = true,
+            advanceCreateDays = 5,
+            templateRootGuid = Guid.parse("f2".repeat(16)),
+        )
+        // Auto-posts but still flagged for review.
+        val autoPostNotify = document.createScheduledTransaction(
+            guid = Guid.parse("2".repeat(32)),
+            name = "AutoNotify",
+            description = "AutoNotify",
+            currencyCode = "USD",
+            start = "2026-01-15",
+            recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-15", WeekendAdjust.NONE),
+            templateSplits = listOf(
+                Triple(bank, Money(100, 100), Guid.parse("f3".repeat(16))),
+                Triple(salary, Money(-100, 100), Guid.parse("f4".repeat(16))),
+            ),
+            templateAccountGuid = Guid.parse("d2".repeat(16)),
+            templateTransactionGuid = Guid.parse("e2".repeat(16)),
+            autoCreate = true,
+            autoCreateNotify = true,
+            advanceCreateDays = 5,
+        )
+        // Within advanceCreateDays but autoCreate is off -- needs a human decision.
+        val needsApproval = document.createScheduledTransaction(
+            guid = Guid.parse("3".repeat(32)),
+            name = "Manual",
+            description = "Manual",
+            currencyCode = "USD",
+            start = "2026-01-15",
+            recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-15", WeekendAdjust.NONE),
+            templateSplits = listOf(
+                Triple(bank, Money(100, 100), Guid.parse("f5".repeat(16))),
+                Triple(salary, Money(-100, 100), Guid.parse("f6".repeat(16))),
+            ),
+            templateAccountGuid = Guid.parse("d3".repeat(16)),
+            templateTransactionGuid = Guid.parse("e3".repeat(16)),
+            advanceCreateDays = 5,
+        )
+        // Further out than advanceCreateDays but within advanceRemindDays of it.
+        val reminder = document.createScheduledTransaction(
+            guid = Guid.parse("4".repeat(32)),
+            name = "Reminder",
+            description = "Reminder",
+            currencyCode = "USD",
+            start = "2026-02-01",
+            recurrence = Recurrence(PeriodType.MONTH, 1, "2026-02-01", WeekendAdjust.NONE),
+            templateSplits = listOf(
+                Triple(bank, Money(100, 100), Guid.parse("f7".repeat(16))),
+                Triple(salary, Money(-100, 100), Guid.parse("f8".repeat(16))),
+            ),
+            templateAccountGuid = Guid.parse("d4".repeat(16)),
+            templateTransactionGuid = Guid.parse("e4".repeat(16)),
+            advanceCreateDays = 1,
+            advanceRemindDays = 20,
+        )
+        // Disabled -- never due, even though it would otherwise match.
+        document.createScheduledTransaction(
+            guid = Guid.parse("5".repeat(32)),
+            name = "Off",
+            description = "Off",
+            currencyCode = "USD",
+            start = "2026-01-15",
+            recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-15", WeekendAdjust.NONE),
+            templateSplits = listOf(
+                Triple(bank, Money(100, 100), Guid.parse("f9".repeat(16))),
+                Triple(salary, Money(-100, 100), Guid.parse("fa".repeat(16))),
+            ),
+            templateAccountGuid = Guid.parse("d5".repeat(16)),
+            templateTransactionGuid = Guid.parse("e5".repeat(16)),
+            enabled = false,
+            autoCreate = true,
+            advanceCreateDays = 5,
+        )
+        // Already exhausted its occurrence count -- never due again.
+        document.createScheduledTransaction(
+            guid = Guid.parse("6".repeat(32)),
+            name = "Exhausted",
+            description = "Exhausted",
+            currencyCode = "USD",
+            start = "2026-01-15",
+            recurrence = Recurrence(PeriodType.MONTH, 1, "2026-01-15", WeekendAdjust.NONE),
+            templateSplits = listOf(
+                Triple(bank, Money(100, 100), Guid.parse("fb".repeat(16))),
+                Triple(salary, Money(-100, 100), Guid.parse("fc".repeat(16))),
+            ),
+            templateAccountGuid = Guid.parse("d6".repeat(16)),
+            templateTransactionGuid = Guid.parse("e6".repeat(16)),
+            advanceCreateDays = 5,
+            end = ScheduledEnd.Occurrences(0),
+        )
+
+        val due = document.dueScheduledInstances("2026-01-14")
+        val byGuid = due.associateBy { it.scheduledTransactionGuid }
+        assertEquals(DueInstanceAction.AUTO_POST, byGuid[autoPost.guid]?.action)
+        assertEquals(DueInstanceAction.AUTO_POST_NOTIFY, byGuid[autoPostNotify.guid]?.action)
+        assertEquals(DueInstanceAction.NEEDS_APPROVAL, byGuid[needsApproval.guid]?.action)
+        assertEquals(DueInstanceAction.REMINDER, byGuid[reminder.guid]?.action)
+        assertEquals("2026-01-15", byGuid[autoPost.guid]?.date)
+        assertEquals(4, due.size) // the disabled and exhausted schedules never appear
+    }
+
+    @Test
+    fun `deleteScheduledTransaction also removes its template account and transaction, and no-ops on an unknown guid`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val bank = assertNotNull(document.accounts().firstOrNull { it.name == "Bank" }?.guid)
+        val salary = assertNotNull(document.accounts().firstOrNull { it.name == "Salary" }?.guid)
+        val sxGuid = Guid.parse("1".repeat(32))
+        val sx = createMonthlySalary(document, sxGuid, bank, salary)
+
+        document.deleteScheduledTransaction(sxGuid)
+        assertNull(document.scheduledTransaction(sxGuid))
+        val serialized = String(document.serialize(), Charsets.UTF_8)
+        assertFalse(sx.templateAccountGuid.raw in serialized)
+
+        document.deleteScheduledTransaction(Guid.parse("f".repeat(32)))
+    }
 }
