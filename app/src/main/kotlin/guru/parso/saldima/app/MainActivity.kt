@@ -48,7 +48,10 @@ private val tabs = listOf(
     Tab("Budgets", "📊"),
     Tab("Prices", "💱"),
     Tab("Invoices", "🧾"),
-    Tab("Bills", "📦"),
+    // "Bills" moved into the Accounts screen's overflow menu (issue #56):
+    // Reconcile was buried in each account's row menu, so it takes this
+    // top-level slot instead.
+    Tab("Reconcile", "✓"),
     Tab("Receipts", "▧"),
     Tab("Reports", "◫"),
     Tab("Settings", "⚙"),
@@ -80,7 +83,7 @@ private fun SaldimaApp() {
             3 -> BudgetsScreen(repository)
             4 -> PricesScreen(repository)
             5 -> InvoicesScreen(repository)
-            6 -> BillsScreen(repository)
+            6 -> ReconcileScreen(repository)
             7 -> ReceiptsScreen(repository)
             8 -> ReportsScreen(repository)
             else -> SettingsScreen(repository, padding)

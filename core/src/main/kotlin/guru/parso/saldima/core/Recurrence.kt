@@ -38,17 +38,23 @@ private fun pad2(value: Int): String = if (value < 10) "0$value" else value.toSt
 private fun formatIso(parts: DateParts): String =
     "${parts.y.toString().padStart(4, '0')}-${pad2(parts.m)}-${pad2(parts.d)}"
 
-private fun isLeapYear(year: Int): Boolean = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+/**
+ * Visible to the rest of `:core` so the statement importer's `dayOrdinal`
+ * (duplicate detection, QIF/OFX/CSV/PDF date validation) reuses this exact
+ * day-counting math instead of a second copy -- see `ImportDate.kt` and
+ * `ImportDuplicates.kt`.
+ */
+internal fun isLeapYear(year: Int): Boolean = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 
 private val DAYS_IN_MONTH = intArrayOf(31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
 
-private fun daysInMonth(year: Int, month: Int): Int {
+internal fun daysInMonth(year: Int, month: Int): Int {
     if (month == 2 && isLeapYear(year)) return 29
     return DAYS_IN_MONTH.getOrElse(month - 1) { 30 }
 }
 
 /** Howard Hinnant's `days_from_civil`: days since 1970-01-01, proleptic Gregorian. */
-private fun daysFromCivil(y: Int, m: Int, d: Int): Long {
+internal fun daysFromCivil(y: Int, m: Int, d: Int): Long {
     val year = (if (m <= 2) y - 1 else y).toLong()
     val era = Math.floorDiv(if (year >= 0) year else year - 399, 400L)
     val yoe = year - era * 400
