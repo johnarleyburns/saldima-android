@@ -65,5 +65,10 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("com.android.billingclient:billing:7.1.1")
+    // Apache-2.0; maintained Android port of Apache PDFBox. Used only for
+    // PDF statement text extraction (StatementImport feature) -- the
+    // platform's own android.graphics.pdf.PdfRenderer only rasterizes
+    // pages, it has no text-extraction API.
+    implementation("com.tom-roush:pdfbox-android:2.0.27.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
