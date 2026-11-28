@@ -125,4 +125,20 @@ class RecurrenceTest {
         val r = recurrence(periodType = PeriodType.DAY, multiplier = 1, start = "not-a-date")
         assertFailsWith<IllegalArgumentException> { nextInstance(r, "2026-01-01") }
     }
+
+    @Test
+    fun `daysBetween is order-independent`() {
+        assertEquals(9L, daysBetween("2026-01-01", "2026-01-10"))
+        assertEquals(9L, daysBetween("2026-01-10", "2026-01-01"))
+    }
+
+    @Test
+    fun `daysBetween is zero for the same date`() {
+        assertEquals(0L, daysBetween("2026-01-01", "2026-01-01"))
+    }
+
+    @Test
+    fun `daysBetween counts across a year boundary`() {
+        assertEquals(7L, daysBetween("2025-12-28", "2026-01-04"))
+    }
 }

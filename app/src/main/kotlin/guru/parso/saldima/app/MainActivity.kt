@@ -46,6 +46,7 @@ private val tabs = listOf(
     Tab("Register", "≡"),
     Tab("Scheduled", "⏰"),
     Tab("Budgets", "📊"),
+    Tab("Prices", "💱"),
     Tab("Invoices", "🧾"),
     Tab("Bills", "📦"),
     Tab("Receipts", "▧"),
@@ -77,10 +78,11 @@ private fun SaldimaApp() {
             1 -> JournalScreen(repository)
             2 -> ScheduledScreen(repository)
             3 -> BudgetsScreen(repository)
-            4 -> InvoicesScreen(repository)
-            5 -> BillsScreen(repository)
-            6 -> ReceiptsScreen(repository)
-            7 -> ReportsScreen(repository)
+            4 -> PricesScreen(repository)
+            5 -> InvoicesScreen(repository)
+            6 -> BillsScreen(repository)
+            7 -> ReceiptsScreen(repository)
+            8 -> ReportsScreen(repository)
             else -> SettingsScreen(repository, padding)
         }
     }

@@ -1359,4 +1359,364 @@ class XmlBookDocumentTest {
         assertEquals(document.budget(guid), reparsed.budget(guid))
         assertEquals(Money(50000, 100), reparsed.budgetAmount(guid, bank, 0))
     }
+
+    // MARK: - Prices (GNCPrice / price database)
+
+    private val usd = CommodityRef("CURRENCY", "USD")
+    private val eur = CommodityRef("CURRENCY", "EUR")
+    private val aapl = CommodityRef("NASDAQ", "AAPL")
+
+    @Test
+    fun `creates a price matching real GnuCash's on-disk shape, and reads it back`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val guid = Guid.parse("1".repeat(32))
+        val price = document.createPrice(
+            guid = guid,
+            commodity = eur,
+            currency = usd,
+            time = "2026-01-15 00:00:00 +0000",
+            value = Money(108, 100),
+        )
+
+        assertEquals(
+            XmlPrice(
+                guid = guid,
+                commodity = eur,
+                currency = usd,
+                time = "2026-01-15 00:00:00 +0000",
+                source = "user:price-editor",
+                type = "",
+                value = Money(108, 100),
+            ),
+            price,
+        )
+
+        val serialized = String(document.serialize(), Charsets.UTF_8)
+        assertTrue("<gnc:pricedb version=\"1\">" in serialized)
+        assertTrue("<price:id type=\"guid\">${guid.raw}</price:id>" in serialized)
+        assertTrue(
+            "<price:commodity><cmdty:space>CURRENCY</cmdty:space><cmdty:id>EUR</cmdty:id></price:commodity>" in serialized,
+        )
+        assertTrue("<price:source>user:price-editor</price:source>" in serialized)
+        assertFalse("<price:type>" in serialized)
+        assertTrue("<price:value>108/100</price:value>" in serialized)
+
+        val reparsed = XmlBookDocument.parse(document.serialize())
+        assertEquals(price, reparsed.price(guid))
+    }
+
+    @Test
+    fun `writes price type only when given, before price value`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        document.createPrice(
+            guid = Guid.parse("2".repeat(32)),
+            commodity = aapl,
+            currency = usd,
+            time = "2026-01-15 00:00:00 +0000",
+            type = "last",
+            value = Money(19000, 100),
+        )
+        val serialized = String(document.serialize(), Charsets.UTF_8)
+        assertTrue("<price:type>last</price:type><price:value>19000/100</price:value>" in serialized)
+    }
+
+    @Test
+    fun `omits gnc pricedb entirely when the book has no prices`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        assertFalse("gnc:pricedb" in String(document.serialize(), Charsets.UTF_8))
+    }
+
+    @Test
+    fun `removes gnc pricedb once the last price is deleted`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val guid = Guid.parse("1".repeat(32))
+        document.createPrice(
+            guid = guid,
+            commodity = eur,
+            currency = usd,
+            time = "2026-01-15 00:00:00 +0000",
+            value = Money(108, 100),
+        )
+        assertTrue("gnc:pricedb" in String(document.serialize(), Charsets.UTF_8))
+        document.deletePrice(guid)
+        assertEquals(emptyList(), document.prices())
+        assertFalse("gnc:pricedb" in String(document.serialize(), Charsets.UTF_8))
+        // Deleting an unknown price is a silent no-op, matching deleteAccount/deleteBudget.
+        document.deletePrice(Guid.parse("f".repeat(32)))
+    }
+
+    @Test
+    fun `supports multiple prices across different commodity currency pairs`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        document.createPrice(
+            guid = Guid.parse("1".repeat(32)),
+            commodity = eur,
+            currency = usd,
+            time = "2026-01-15 00:00:00 +0000",
+            value = Money(108, 100),
+        )
+        document.createPrice(
+            guid = Guid.parse("2".repeat(32)),
+            commodity = aapl,
+            currency = usd,
+            time = "2026-01-15 00:00:00 +0000",
+            value = Money(19000, 100),
+        )
+        assertEquals(2, document.prices().size)
+    }
+
+    @Test
+    fun `rejects a duplicate price guid`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val guid = Guid.parse("1".repeat(32))
+        document.createPrice(
+            guid = guid,
+            commodity = eur,
+            currency = usd,
+            time = "2026-01-15 00:00:00 +0000",
+            value = Money(108, 100),
+        )
+        assertFailsWith<BookFormatException> {
+            document.createPrice(
+                guid = guid,
+                commodity = aapl,
+                currency = usd,
+                time = "2026-01-15 00:00:00 +0000",
+                value = Money(1, 1),
+            )
+        }
+    }
+
+    @Test
+    fun `updates time, value and type independently, adding and removing type`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        val guid = Guid.parse("1".repeat(32))
+        document.createPrice(
+            guid = guid,
+            commodity = eur,
+            currency = usd,
+            time = "2026-01-15 00:00:00 +0000",
+            value = Money(108, 100),
+        )
+
+        val withTime = document.updatePrice(guid, time = "2026-02-01 00:00:00 +0000")
+        assertEquals("2026-02-01 00:00:00 +0000", withTime.time)
+        assertEquals(Money(108, 100), withTime.value)
+
+        val withValue = document.updatePrice(guid, value = Money(110, 100))
+        assertEquals(Money(110, 100), withValue.value)
+
+        val withType = document.updatePrice(guid, type = "last")
+        assertEquals("last", withType.type)
+        assertTrue(
+            "<price:type>last</price:type><price:value>110/100</price:value>" in
+                String(document.serialize(), Charsets.UTF_8),
+        )
+
+        // Replacing an already-set type updates it in place.
+        val withReplacedType = document.updatePrice(guid, type = "transaction")
+        assertEquals("transaction", withReplacedType.type)
+
+        val withoutType = document.updatePrice(guid, type = "")
+        assertEquals("", withoutType.type)
+        assertFalse("<price:type>" in String(document.serialize(), Charsets.UTF_8))
+
+        // Setting the same (now-absent) type again is a no-op, not an error.
+        val stillWithoutType = document.updatePrice(guid, type = "")
+        assertEquals("", stillWithoutType.type)
+    }
+
+    @Test
+    fun `rejects updating an unknown price`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        assertFailsWith<BookFormatException> {
+            document.updatePrice(Guid.parse("f".repeat(32)), value = Money(1, 1))
+        }
+    }
+
+    @Test
+    fun `returns null for an unknown price guid`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        assertNull(document.price(Guid.parse("f".repeat(32))))
+    }
+
+    @Test
+    fun `creates gnc pricedb right after book id when the book declares no commodities`() {
+        val xml = """<?xml version="1.0" encoding="utf-8" ?>
+<gnc-v2 xmlns:gnc="http://www.gnucash.org/XML/gnc" xmlns:book="http://www.gnucash.org/XML/book" xmlns:cmdty="http://www.gnucash.org/XML/cmdty" xmlns:price="http://www.gnucash.org/XML/price" xmlns:ts="http://www.gnucash.org/XML/ts">
+<gnc:book version="2.0.0">
+<book:id type="guid">${"b".repeat(32)}</book:id>
+</gnc:book>
+</gnc-v2>"""
+        val document = XmlBookDocument.parse(xml.toByteArray(Charsets.UTF_8))
+        val guid = Guid.parse("1".repeat(32))
+        val price = document.createPrice(
+            guid = guid,
+            commodity = eur,
+            currency = usd,
+            time = "2026-01-15 00:00:00 +0000",
+            value = Money(108, 100),
+        )
+        assertEquals(price, document.price(guid))
+        val serialized = String(document.serialize(), Charsets.UTF_8)
+        // After book:id (never before it), even with no commodity to anchor on.
+        assertTrue(serialized.indexOf("<book:id") < serialized.indexOf("<gnc:pricedb"))
+    }
+
+    @Test
+    fun `defaults missing commodity, currency, time, source and value on a malformed price entry`() {
+        val xml = """<?xml version="1.0" encoding="utf-8" ?>
+<gnc-v2 xmlns:gnc="http://www.gnucash.org/XML/gnc" xmlns:book="http://www.gnucash.org/XML/book" xmlns:price="http://www.gnucash.org/XML/price">
+<gnc:book version="2.0.0">
+<book:id type="guid">${"b".repeat(32)}</book:id>
+<gnc:pricedb version="1">
+  <price>
+    <price:id type="guid">${"8".repeat(32)}</price:id>
+  </price>
+</gnc:pricedb>
+</gnc:book>
+</gnc-v2>"""
+        val document = XmlBookDocument.parse(xml.toByteArray(Charsets.UTF_8))
+        val guid = Guid.parse("8".repeat(32))
+        assertEquals(
+            XmlPrice(
+                guid = guid,
+                commodity = CommodityRef("ISO4217", "USD"),
+                currency = CommodityRef("ISO4217", "USD"),
+                time = "",
+                source = "",
+                type = "",
+                value = Money(0, 1),
+            ),
+            document.price(guid),
+        )
+
+        // Updating a malformed entry with no price:time wrapper is a safe no-op for that field...
+        val updated = document.updatePrice(guid, time = "2026-01-01 00:00:00 +0000", type = "last")
+        assertEquals("", updated.time)
+        // ...but adding a type still works, inserted even with no price:value to anchor before.
+        assertEquals("last", updated.type)
+        assertTrue("<price:type>last</price:type>" in String(document.serialize(), Charsets.UTF_8))
+    }
+
+    // MARK: nearestPrice
+
+    private fun withThreePrices(document: XmlBookDocument) {
+        document.createPrice(
+            guid = Guid.parse("1".repeat(32)),
+            commodity = eur,
+            currency = usd,
+            time = "2026-01-01 00:00:00 +0000",
+            value = Money(105, 100),
+        )
+        document.createPrice(
+            guid = Guid.parse("2".repeat(32)),
+            commodity = eur,
+            currency = usd,
+            time = "2026-01-10 00:00:00 +0000",
+            value = Money(108, 100),
+        )
+        document.createPrice(
+            guid = Guid.parse("3".repeat(32)),
+            commodity = eur,
+            currency = usd,
+            time = "2026-01-20 00:00:00 +0000",
+            value = Money(110, 100),
+        )
+    }
+
+    @Test
+    fun `nearestPrice returns an exact match`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        withThreePrices(document)
+        assertEquals(Money(108, 100), document.nearestPrice(eur, usd, "2026-01-10")?.value)
+    }
+
+    @Test
+    fun `nearestPrice picks the closer of two surrounding prices`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        withThreePrices(document)
+        // 2026-01-12 is 2 days after the 10th, 8 days before the 20th.
+        assertEquals(Money(108, 100), document.nearestPrice(eur, usd, "2026-01-12")?.value)
+        // 2026-01-16 is 6 days after the 10th, 4 days before the 20th.
+        assertEquals(Money(110, 100), document.nearestPrice(eur, usd, "2026-01-16")?.value)
+    }
+
+    @Test
+    fun `nearestPrice picks the earliest price when asking before it, and the latest when asking after`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        withThreePrices(document)
+        assertEquals(Money(105, 100), document.nearestPrice(eur, usd, "2025-12-01")?.value)
+        assertEquals(Money(110, 100), document.nearestPrice(eur, usd, "2026-06-01")?.value)
+    }
+
+    @Test
+    fun `nearestPrice returns null when no price exists for the pair`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        withThreePrices(document)
+        assertNull(document.nearestPrice(aapl, usd, "2026-01-10"))
+    }
+
+    // MARK: convertMoney
+
+    @Test
+    fun `convertMoney returns the value unchanged for identical commodities`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        assertEquals(Money(100, 1), document.convertMoney(Money(100, 1), usd, usd, "2026-01-10"))
+    }
+
+    @Test
+    fun `convertMoney converts using the nearest price`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        document.createPrice(
+            guid = Guid.parse("1".repeat(32)),
+            commodity = eur,
+            currency = usd,
+            time = "2026-01-10 00:00:00 +0000",
+            value = Money(2, 1),
+        )
+        assertEquals(Money(100, 1), document.convertMoney(Money(50, 1), eur, usd, "2026-01-10"))
+    }
+
+    @Test
+    fun `convertMoney returns null when no price exists for the pair`() {
+        val document = XmlBookDocument.parse(gnucashBytes("oracle-mini.gnucash"))
+        assertNull(document.convertMoney(Money(50, 1), eur, usd, "2026-01-10"))
+    }
+
+    @Test
+    fun `round-trips a hand-written price fixture with no price type, defaulting it to empty`() {
+        val guid = Guid.parse("9".repeat(32))
+        val xml = """<?xml version="1.0" encoding="utf-8" ?>
+<gnc-v2 xmlns:gnc="http://www.gnucash.org/XML/gnc" xmlns:book="http://www.gnucash.org/XML/book" xmlns:cmdty="http://www.gnucash.org/XML/cmdty" xmlns:price="http://www.gnucash.org/XML/price" xmlns:ts="http://www.gnucash.org/XML/ts">
+<gnc:book version="2.0.0">
+<book:id type="guid">${"b".repeat(32)}</book:id>
+<gnc:pricedb version="1">
+  <price>
+    <price:id type="guid">${guid.raw}</price:id>
+    <price:commodity><cmdty:space>NASDAQ</cmdty:space><cmdty:id>CORL</cmdty:id></price:commodity>
+    <price:currency><cmdty:space>ISO4217</cmdty:space><cmdty:id>USD</cmdty:id></price:currency>
+    <price:time><ts:date>2001-03-26 12:59:00 -0800</ts:date></price:time>
+    <price:source>Finance::Quote</price:source>
+    <price:value>237500000/100000000</price:value>
+  </price>
+</gnc:pricedb>
+</gnc:book>
+</gnc-v2>"""
+        val document = XmlBookDocument.parse(xml.toByteArray(Charsets.UTF_8))
+        assertEquals(
+            XmlPrice(
+                guid = guid,
+                commodity = CommodityRef("NASDAQ", "CORL"),
+                currency = CommodityRef("ISO4217", "USD"),
+                time = "2001-03-26 12:59:00 -0800",
+                source = "Finance::Quote",
+                type = "",
+                value = Money(237500000, 100000000),
+            ),
+            document.price(guid),
+        )
+        val reparsed = XmlBookDocument.parse(document.serialize())
+        assertEquals(document.price(guid), reparsed.price(guid))
+    }
 }

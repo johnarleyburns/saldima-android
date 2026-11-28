@@ -33,6 +33,7 @@ class XmlBookDocument private constructor(
     private val vendorIndex = mutableMapOf<Guid, XmlNode>()
     private val scheduledTransactionIndex = mutableMapOf<Guid, XmlNode>()
     private val budgetIndex = mutableMapOf<Guid, XmlNode>()
+    private val priceIndex = mutableMapOf<Guid, XmlNode>()
 
     init {
         reindex()
@@ -46,6 +47,7 @@ class XmlBookDocument private constructor(
         vendorIndex.clear()
         scheduledTransactionIndex.clear()
         budgetIndex.clear()
+        priceIndex.clear()
         for (node in children(book, "account")) {
             guidValue(node, "id")?.let { accountIndex[it] = node }
         }
@@ -70,6 +72,11 @@ class XmlBookDocument private constructor(
         for (node in children(book, "budget")) {
             guidValue(node, "id")?.let { budgetIndex[it] = node }
         }
+        firstChild(book, "pricedb")?.let { pricedb ->
+            for (node in children(pricedb, "price")) {
+                guidValue(node, "id")?.let { priceIndex[it] = node }
+            }
+        }
     }
 
     private fun ownerType(node: XmlNode): String? =
@@ -82,6 +89,7 @@ class XmlBookDocument private constructor(
             "xmlns:book" to "http://www.gnucash.org/XML/book",
             "xmlns:cd" to "http://www.gnucash.org/XML/cd",
             "xmlns:cmdty" to "http://www.gnucash.org/XML/cmdty",
+            "xmlns:price" to "http://www.gnucash.org/XML/price",
             "xmlns:slot" to "http://www.gnucash.org/XML/slot",
             "xmlns:split" to "http://www.gnucash.org/XML/split",
             "xmlns:trn" to "http://www.gnucash.org/XML/trn",
@@ -1443,6 +1451,164 @@ class XmlBookDocument private constructor(
             }
         }
         return total
+    }
+
+    // MARK: - Prices (GNCPrice / price database)
+
+    fun prices(): List<XmlPrice> = priceIndex.values.map(::priceRow)
+
+    fun price(guid: Guid): XmlPrice? = priceIndex[guid]?.let(::priceRow)
+
+    private fun readCommodityRef(parent: XmlNode, tag: String): CommodityRef? {
+        val ref = firstChild(parent, tag) ?: return null
+        return CommodityRef(
+            space = firstChild(ref, "space")?.text ?: "",
+            id = firstChild(ref, "id")?.text ?: "",
+        )
+    }
+
+    private fun commodityRefNode(tag: String, ref: CommodityRef): XmlNode {
+        val node = XmlNode(tag)
+        node.addChild(leaf("cmdty:space", ref.space))
+        node.addChild(leaf("cmdty:id", ref.id))
+        return node
+    }
+
+    private fun priceRow(node: XmlNode): XmlPrice {
+        val fallback = CommodityRef("ISO4217", "USD")
+        val guid = guidValue(node, "id") ?: throw BookFormatException("corrupt price entry")
+        val commodity = readCommodityRef(node, "commodity") ?: fallback
+        val currency = readCommodityRef(node, "currency") ?: fallback
+        val time = firstChild(node, "time")?.let { firstChild(it, "date")?.text } ?: ""
+        val source = firstChild(node, "source")?.text ?: ""
+        val type = firstChild(node, "type")?.text ?: ""
+        val value = firstChild(node, "value")?.let { rational(it.text) } ?: Money.ZERO
+        return XmlPrice(guid, commodity, currency, time, source, type, value)
+    }
+
+    private fun findPricedbNode(): XmlNode? = firstChild(book, "pricedb")
+
+    /**
+     * `<gnc:pricedb>` sits right after the last commodity -- before any
+     * account/transaction. Falls back to right after `book:id` on the
+     * (unrealistic in practice, every real book declares a currency) case
+     * of a book with no commodities at all, rather than before it.
+     */
+    private fun findOrCreatePricedbNode(): XmlNode {
+        findPricedbNode()?.let { return it }
+        val created = XmlNode("gnc:pricedb")
+        created.attributes["version"] = "1"
+        val anchor = children(book, "commodity").lastOrNull() ?: firstChild(book, "id")
+        val index = anchor?.let { (it.indexInParent() ?: -1) + 1 } ?: 0
+        book.insertChild(created, index)
+        return created
+    }
+
+    /**
+     * Creates a price matching real GnuCash's on-disk shape exactly: a
+     * direct child of `<gnc:pricedb>`, children in the order `price:id`,
+     * `price:commodity`, `price:currency`, `price:time` (wrapping
+     * `ts:date`), `price:source` (always `"user:price-editor"` -- Milestone
+     * 1 never fetches an online quote), `price:type` (omitted entirely
+     * when unset, not an empty element), `price:value`. [updatePrice] never
+     * allows changing the commodity/currency pair -- same convention as
+     * scheduled transactions/budgets not allowing their recurrence to be
+     * edited after creation; delete and recreate instead.
+     */
+    fun createPrice(
+        guid: Guid,
+        commodity: CommodityRef,
+        currency: CommodityRef,
+        time: String,
+        value: Money,
+        type: String = "",
+    ): XmlPrice {
+        if (priceIndex.containsKey(guid)) {
+            throw BookFormatException("duplicate price ${guid.raw}")
+        }
+        val pricedbNode = findOrCreatePricedbNode()
+        val priceNode = XmlNode("price")
+        priceNode.addChild(leaf("price:id", guid.raw, "type" to "guid"))
+        priceNode.addChild(commodityRefNode("price:commodity", commodity))
+        priceNode.addChild(commodityRefNode("price:currency", currency))
+        val timeNode = XmlNode("price:time")
+        timeNode.addChild(leaf("ts:date", time))
+        priceNode.addChild(timeNode)
+        // Milestone 1: every price this engine creates is user-entered.
+        priceNode.addChild(leaf("price:source", "user:price-editor"))
+        if (type.isNotEmpty()) priceNode.addChild(leaf("price:type", type))
+        priceNode.addChild(leaf("price:value", "${value.num}/${value.denom}"))
+        pricedbNode.addChild(priceNode)
+        priceIndex[guid] = priceNode
+        return priceRow(priceNode)
+    }
+
+    fun updatePrice(
+        guid: Guid,
+        time: String? = null,
+        type: String? = null,
+        value: Money? = null,
+    ): XmlPrice {
+        val node = priceIndex[guid] ?: throw BookFormatException("unknown price ${guid.raw}")
+        if (time != null) {
+            firstChild(node, "time")?.let { setChildText(it, "date", "ts:date", time) }
+        }
+        if (type != null) {
+            val existingType = firstChild(node, "type")
+            if (existingType != null) {
+                if (type.isEmpty()) existingType.detach() else setChildText(node, "type", "price:type", type)
+            } else if (type.isNotEmpty()) {
+                val valueNode = firstChild(node, "value")
+                val insertAt = valueNode?.indexInParent() ?: node.children.size
+                node.insertChild(leaf("price:type", type), insertAt)
+            }
+        }
+        if (value != null) {
+            setChildText(node, "value", "price:value", "${value.num}/${value.denom}")
+        }
+        return priceRow(node)
+    }
+
+    /** Silent no-op on an unknown guid, matching deleteAccount/deleteBudget. */
+    fun deletePrice(guid: Guid) {
+        val node = priceIndex[guid] ?: return
+        val pricedbNode = findPricedbNode()
+        node.detach()
+        priceIndex.remove(guid)
+        // Real GnuCash omits <gnc:pricedb> entirely once it holds no prices.
+        if (pricedbNode != null && pricedbNode.children.isEmpty()) pricedbNode.detach()
+    }
+
+    /**
+     * The price for `commodity`/`currency` closest in time to `asOf`
+     * (desktop GnuCash's `gnc_pricedb_lookup_nearest_in_time`), or `null` if
+     * none exists for that exact pair. Milestone 1: directional only -- no
+     * reciprocal-pair fallback.
+     */
+    fun nearestPrice(commodity: CommodityRef, currency: CommodityRef, asOf: String): XmlPrice? {
+        val candidates = prices().filter { it.commodity == commodity && it.currency == currency }
+        var best: XmlPrice? = null
+        var bestDistance = Long.MAX_VALUE
+        for (candidate in candidates) {
+            val distance = daysBetween(candidate.time.take(10), asOf)
+            if (distance < bestDistance) {
+                best = candidate
+                bestDistance = distance
+            }
+        }
+        return best
+    }
+
+    /**
+     * Converts `value` (in `from`'s commodity) to `to`'s commodity using the
+     * nearest price as of `asOf`. `null` -- never a silent 1:1 guess --
+     * when no price exists for the pair and the commodities aren't
+     * identical.
+     */
+    fun convertMoney(value: Money, from: CommodityRef, to: CommodityRef, asOf: String): Money? {
+        if (from == to) return value
+        val price = nearestPrice(from, to, asOf) ?: return null
+        return Money.multiply(value, price.value)
     }
 
     // MARK: - Customers (GncCustomer)

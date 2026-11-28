@@ -122,6 +122,20 @@ fun addDays(date: String, days: Int): String {
     return formatIso(civilFromDays(daysFromCivil(parts.y, parts.m, parts.d) + days))
 }
 
+/**
+ * Absolute number of days between two `YYYY-MM-DD` dates, order-independent.
+ * Mirrors `recurrence.ts`'s own `daysBetween` export; used by the price
+ * database's `nearestPrice` to pick the closest price in time without ever
+ * touching a wall-clock/`java.time` API.
+ */
+fun daysBetween(a: String, b: String): Long {
+    val left = parseIso(a)
+    val right = parseIso(b)
+    val leftDays = daysFromCivil(left.y, left.m, left.d)
+    val rightDays = daysFromCivil(right.y, right.m, right.d)
+    return kotlin.math.abs(rightDays - leftDays)
+}
+
 private fun applyWeekendAdjust(parts: DateParts, adjust: WeekendAdjust): DateParts {
     if (adjust == WeekendAdjust.NONE) return parts
     val weekday = dayOfWeek(parts)
