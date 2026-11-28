@@ -15,6 +15,7 @@ import guru.parso.saldima.core.BookFormat
 import guru.parso.saldima.core.BookFormatException
 import guru.parso.saldima.core.BookSnapshot
 import guru.parso.saldima.core.BudgetPeriodRange
+import guru.parso.saldima.core.CommodityRef
 import guru.parso.saldima.core.CustomerDraft
 import guru.parso.saldima.core.DueInstanceAction
 import guru.parso.saldima.core.DueScheduledInstance
@@ -35,6 +36,7 @@ import guru.parso.saldima.core.XmlBudget
 import guru.parso.saldima.core.XmlCustomer
 import guru.parso.saldima.core.XmlInvoice
 import guru.parso.saldima.core.XmlInvoiceEntry
+import guru.parso.saldima.core.XmlPrice
 import guru.parso.saldima.core.XmlScheduledTransaction
 import guru.parso.saldima.core.XmlVendor
 import guru.parso.saldima.core.registerExportFilename
@@ -79,6 +81,8 @@ class BookRepository(private val context: Context) {
     var dueScheduledReview by mutableStateOf<List<DueScheduledInstance>>(emptyList())
         private set
     var budgets by mutableStateOf<List<XmlBudget>>(emptyList())
+        private set
+    var prices by mutableStateOf<List<XmlPrice>>(emptyList())
         private set
     var autoPostedCount by mutableIntStateOf(0)
         private set
@@ -292,6 +296,7 @@ class BookRepository(private val context: Context) {
         bills = doc.bills().sortedByDescending { it.dateOpened }
         scheduledTransactions = doc.scheduledTransactions().sortedBy { it.name.lowercase() }
         budgets = doc.budgets().sortedBy { it.name.lowercase() }
+        prices = doc.prices().sortedByDescending { it.time }
     }
 
     // MARK: - Clients (GncCustomer)
@@ -1011,6 +1016,54 @@ class BookRepository(private val context: Context) {
             val (accountGuid, periodIndex) = key
             doc.setBudgetAmount(budgetGuid, accountGuid, periodIndex, amount)
         }
+        error = null
+        save()
+    }
+
+    // MARK: - Prices (GNCPrice / price database)
+
+    /**
+     * The commodity/currency pair is immutable after creation -- same
+     * convention as a budget's recurrence or a scheduled transaction's
+     * recurrence; delete and recreate instead of editing the pair.
+     */
+    fun createPrice(commodity: CommodityRef, currency: CommodityRef, time: String, value: Money, type: String = "") {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        try {
+            doc.createPrice(ids.next(), commodity, currency, time, value, type)
+        } catch (failure: BookFormatException) {
+            error = failure.message ?: "Could not create that price."
+            return
+        }
+        error = null
+        save()
+    }
+
+    /** Only time/type/value are editable here -- the commodity/currency pair can't be changed after creation. */
+    fun updatePrice(guid: Guid, time: String? = null, type: String? = null, value: Money? = null) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        try {
+            doc.updatePrice(guid, time = time, type = type, value = value)
+        } catch (failure: BookFormatException) {
+            error = failure.message ?: "Could not update that price."
+            return
+        }
+        error = null
+        save()
+    }
+
+    fun deletePrice(guid: Guid) {
+        val doc = document ?: run {
+            error = "Open a book first."
+            return
+        }
+        doc.deletePrice(guid)
         error = null
         save()
     }
