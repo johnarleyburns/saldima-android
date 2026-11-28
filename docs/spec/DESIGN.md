@@ -425,3 +425,27 @@ public protocol SyncAPI: Sendable {
 ```
 
 View models are `@Observable` classes on the main actor that take these protocols in their initialisers, so every screen's logic is tested with fakes and no simulator. Linked mode stores the device token in the Keychain and the working copy in Application Support; the standalone path never touches the network.
+
+## Android app design (saldima-android)
+
+The Android track mirrors the iPhone app above (standalone by default,
+GnuCash XML as the canonical on-disk book via `XmlBookDocument`, no gating
+purchase) in Kotlin/Compose instead of Swift. Its own architecture baseline
+lives in `saldima-android/docs/architecture/TECHNICAL-DESIGN.md`; this
+section only corrects this design doc's description of reconcile for that
+track, since it's drifted from what shipped.
+
+The API route table above (`/app/reconcile/:guid`) and the iPhone Features
+list just above this section both place reconcile as something reached from
+an account or the register. On Android that's stale: the bottom navigation
+has its own top-level **Reconcile** tab (`ReconcileScreen`), which replaced
+a "Bills" tab — Bills is still available, moved into the Accounts screen's
+overflow menu. The Reconcile tab is also where the QIF/OFX/CSV/PDF statement
+importer (`ImportStatementScreen`) lives: it parses a bank statement and
+bulk-checks the matching splits, rather than reconciling one split at a
+time.
+
+Shipped on Android beyond what this doc otherwise implies as still pending:
+void/unvoid, QIF/CSV register export, transaction search, scheduled/
+recurring transactions, budgets, and the multi-currency price database. The
+`/api/v1` sync client is not shipped; it's still a stub.
