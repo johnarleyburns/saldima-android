@@ -216,6 +216,12 @@ Everything except Scheme reports and online banking is in scope, phased so the p
 | Out | Custom Scheme reports, Guile scripting | — | Out; offer a read-only SQL/CSV export instead | — |
 | Out | HBCI/AqBanking online banking, check printing | — | Out; bank feeds may come later via an aggregator | — |
 
+Check printing is being added, but web-only (owner decision, 2026-11-28): it
+needs a real printer, which isn't a realistic phone workflow. It stays "Out"
+for the iPhone and Android tracks specifically — that's an intentional
+platform split, not a cross-platform parity gap for either mobile app to
+close.
+
 ### Web-only extras
 
 - Upload from and download to desktop GnuCash, with leases (Desktop sync section).
@@ -513,6 +519,39 @@ Checked against the public johnarleyburns/parso-voxglass repo on 2026-11-20; the
 
 - AGPLv3 source in a public repo; you publish the App Store build as sole copyright holder (see License and contributor agreement). Dependencies must be MIT, BSD or Apache.
 - Standalone use is free, with an optional one-time unlock through StoreKit 2 (open question). The hosting subscription is bought on the web; the app signs in to it. Apple may require it to be sold in the app too, so decide before P5.
+
+## Android app (parallel track)
+
+Saldima for Android (`johnarleyburns/saldima-android`) is the same kind of
+standalone, complete GnuCash-compatible book as the iPhone app above, built
+alongside it. See `saldima-android/CLAUDE.md` and `docs/plans/P0.md` in that
+repo for the authoritative status; this section only reconciles this spec
+against what has actually shipped there.
+
+Shipped and verified in that repo's history (git log and merged PRs): the P1
+account tree, P2 multi-split register with void/reverse/duplicate, reports,
+P3 standalone XML open/save, P4 reconcile, and, ahead of this doc's phase
+order, several of P5's items too — QIF/CSV import and export, scheduled
+transactions, budgets — plus the P6 multi-currency price database. The
+`/api/v1` sync client (this spec's P3/A7) is still just a stub; it has not
+shipped.
+
+**Reconcile has moved.** The Feature parity matrix and the Mobile and
+desktop UI table above describe reconcile as something reached from an
+account or the register, matching gnucash-web's `/app/reconcile/:guid`
+route. That's no longer how the Android app works: reconcile is its own
+top-level tab in the bottom navigation (replacing "Bills", which moved into
+the Accounts screen's overflow menu), and it's also where the new
+QIF/OFX/CSV/PDF statement importer lives, so a whole statement's splits can
+be bulk-matched instead of checked off one at a time. The Accounts screen
+still keeps a per-account "Reconcile" shortcut into the same tab for anyone
+already there.
+
+**Purchases are decided for Android**, separately from the iPhone
+StoreKit 2 open question above: the same one-time, non-gating
+`saldima_supporter` consumable is implemented and working through Google
+Play Billing (`SupporterStore`, tested with fakes). There is no open
+purchase-model question on the Android track.
 
 ## Coding-agent handoff
 
